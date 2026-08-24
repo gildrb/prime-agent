@@ -6,6 +6,7 @@ import { basename, dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
 import { describe, expect, it } from "vitest";
 import {
+	acquireDaemonSocketPathLease,
 	cleanupDaemonSocketPath,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
@@ -250,6 +251,36 @@ describe("defaultDaemonSocketPath", () => {
 			if (replacementServer.listening) {
 				await new Promise<void>((resolve) => replacementServer.close(() => resolve()));
 			}
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("acquireDaemonSocketPathLease", () => {
+	it("reports the contended socket path when a rival supervisor holds the lock", async () => {
+		if (process.platform === "win32") {
+			return;
+		}
+
+		const dir = mkdtempSync(join(tmpdir(), "pa-socket-busy-"));
+		const socketPath = join(dir, "daemon.sock");
+		let release: (() => Promise<void>) | undefined;
+		try {
+			// The rival keeps the lock's mtime fresh, exactly as a supervisor that
+			// is still adopting workers does, so it never looks stale.
+			release = await acquireDaemonSocketPathLease(socketPath).then(
+				(lease) => () => lease?.release() ?? Promise.resolve(),
+			);
+
+			// proper-lockfile's own ELOCKED says only "Lock file is already being
+			// held", with no stack into our code and no mention of the path.
+			await expect(acquireDaemonSocketPathLease(socketPath, 100)).rejects.toMatchObject({
+				name: "DaemonSocketPathBusyError",
+				socketPath,
+				message: expect.stringContaining(socketPath),
+			});
+		} finally {
+			await release?.();
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});

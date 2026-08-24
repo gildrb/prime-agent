@@ -12,6 +12,7 @@ const DAEMON_SOCKET_RELEASE_GRACE_MS = 1000;
 const DAEMON_SOCKET_RELEASE_POLL_MS = 25;
 const DAEMON_SOCKET_LOCK_STALE_MS = 5000;
 const DAEMON_SOCKET_LOCK_UPDATE_MS = 1000;
+const DAEMON_SOCKET_LOCK_WAIT_MS = 15_000;
 
 export class DaemonSocketPathLease {
 	private released = false;
@@ -42,22 +43,69 @@ export function defaultDaemonSocketPath(): string {
 	return join(defaultDaemonSocketDir(), "daemon.sock");
 }
 
-export async function acquireDaemonSocketPathLease(socketPath: string): Promise<DaemonSocketPathLease | undefined> {
+/**
+ * Another supervisor process holds the exclusive socket-path lock. proper-lockfile
+ * reports this as a bare `Lock file is already being held` with no stack into our
+ * code and no mention of the contended path, which is unreadable in a daemon log.
+ */
+export class DaemonSocketPathBusyError extends Error {
+	constructor(
+		readonly socketPath: string,
+		readonly waitedMs: number,
+		options?: { cause?: unknown },
+	) {
+		super(
+			`Another Prime Agent daemon supervisor holds the socket path lock for ${socketPath} ` +
+				`and did not release it within ${waitedMs}ms; it is still starting up or shutting down.`,
+			options,
+		);
+		this.name = "DaemonSocketPathBusyError";
+	}
+}
+
+export function isDaemonSocketPathBusyError(error: unknown): error is DaemonSocketPathBusyError {
+	return error instanceof DaemonSocketPathBusyError;
+}
+
+/**
+ * Exit code a supervisor uses when it loses the socket-path lock to a rival that
+ * is still coming up. It is not a crash, so the launcher keeps probing for the
+ * winner instead of charging the exit to the user's command.
+ */
+export const DAEMON_SUPERVISOR_SOCKET_BUSY_EXIT_CODE = 75;
+
+/**
+ * The lock is held for the supervisor's whole life, so `waitMs` is really "how
+ * long a rival supervisor waits for this one to finish starting up". It is a
+ * parameter so tests do not have to sit through the production wait.
+ */
+export async function acquireDaemonSocketPathLease(
+	socketPath: string,
+	waitMs = DAEMON_SOCKET_LOCK_WAIT_MS,
+): Promise<DaemonSocketPathLease | undefined> {
 	ensureDefaultDaemonSocketDir(socketPath);
 	if (process.platform === "win32") {
 		return undefined;
 	}
-	const releaseLock = await lockfile.lock(socketPath, {
-		realpath: false,
-		stale: DAEMON_SOCKET_LOCK_STALE_MS,
-		update: DAEMON_SOCKET_LOCK_UPDATE_MS,
-		retries: {
-			retries: 600,
-			factor: 1,
-			minTimeout: DAEMON_SOCKET_RELEASE_POLL_MS,
-			maxTimeout: DAEMON_SOCKET_RELEASE_POLL_MS,
-		},
-	});
+	let releaseLock: () => Promise<void>;
+	try {
+		releaseLock = await lockfile.lock(socketPath, {
+			realpath: false,
+			stale: DAEMON_SOCKET_LOCK_STALE_MS,
+			update: DAEMON_SOCKET_LOCK_UPDATE_MS,
+			retries: {
+				retries: Math.max(1, Math.ceil(waitMs / DAEMON_SOCKET_RELEASE_POLL_MS)),
+				factor: 1,
+				minTimeout: DAEMON_SOCKET_RELEASE_POLL_MS,
+				maxTimeout: DAEMON_SOCKET_RELEASE_POLL_MS,
+			},
+		});
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ELOCKED") {
+			throw new DaemonSocketPathBusyError(socketPath, waitMs, { cause: error });
+		}
+		throw error;
+	}
 	return new DaemonSocketPathLease(socketPath, releaseLock);
 }
 

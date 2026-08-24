@@ -97,11 +97,13 @@ import {
 import {
 	acquireDaemonSocketPathLease,
 	cleanupDaemonSocketPath,
+	DAEMON_SUPERVISOR_SOCKET_BUSY_EXIT_CODE,
 	type DaemonSocketIdentity,
 	type DaemonSocketPathLease,
 	defaultDaemonSocketDir,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
+	isDaemonSocketPathBusyError,
 	normalizeSocketPath,
 	prepareDaemonSocketPath,
 	restrictDaemonSocketPath,
@@ -149,6 +151,14 @@ const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // an abandoned prepare leaves the daemon permanently fenced with workers stopped.
 const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
+// A worker that is alive but no longer answering IPC costs ~30s to adopt and
+// then walk the recovery ladder. start() holds the exclusive socket-path lock
+// for its whole duration and no client completes the daemon_hello handshake
+// until it resolves, so an unbounded adoption phase makes every concurrent CLI
+// give up connecting, spawn a rival supervisor, and fail on the socket lock --
+// which respawns more rivals. Adopt within a budget instead and let whatever is
+// still recovering finish in the background, exactly as a runtime disconnect does.
+const WORKER_ADOPTION_STARTUP_BUDGET_MS = 10_000;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
@@ -603,7 +613,17 @@ function mergeSessionLists(active: readonly SessionSummary[], saved: readonly Se
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
 	const supervisor = new DaemonSupervisor(socketPath, options);
-	await supervisor.start();
+	try {
+		await supervisor.start();
+	} catch (error) {
+		// Losing the socket-path lock is not a crash: a rival supervisor owns this
+		// socket and the launcher only has to wait for it to finish coming up.
+		// Exiting with a dedicated code keeps that wait out of the user's command.
+		if (isDaemonSocketPathBusyError(error)) {
+			process.exit(DAEMON_SUPERVISOR_SOCKET_BUSY_EXIT_CODE);
+		}
+		throw error;
+	}
 	return new Promise(() => {});
 }
 
@@ -723,18 +743,20 @@ export class DaemonSupervisor {
 			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			let adoptionFailure: unknown;
 			let adoptionFailed = false;
-			await Promise.all(
-				workersToAdopt.map(async (worker) => {
-					try {
-						await this.adoptOrRecoverWorker(worker);
-					} catch (error) {
-						if (!adoptionFailed) {
-							adoptionFailed = true;
-							adoptionFailure = error;
-						}
+			const adopting = new Set(workersToAdopt);
+			const adoptions = workersToAdopt.map(async (worker) => {
+				try {
+					await this.adoptOrRecoverWorker(worker);
+				} catch (error) {
+					if (!adoptionFailed) {
+						adoptionFailed = true;
+						adoptionFailure = error;
 					}
-				}),
-			);
+				} finally {
+					adopting.delete(worker);
+				}
+			});
+			await this.awaitStartupAdoption(adoptions, adopting);
 			if (adoptionFailed) {
 				throw adoptionFailure;
 			}
@@ -2860,6 +2882,34 @@ export class DaemonSupervisor {
 		});
 		if (!response.success) {
 			throw new Error(response.error);
+		}
+	}
+
+	/**
+	 * Wait for startup adoption, but never past WORKER_ADOPTION_STARTUP_BUDGET_MS.
+	 * Healthy workers adopt well inside the budget; an unresponsive one keeps
+	 * recovering in the background rather than holding the socket-path lock and
+	 * every client's daemon_hello hostage for the full connect/list retry ladder.
+	 */
+	private async awaitStartupAdoption(adoptions: Promise<void>[], adopting: Set<ResidentWorker>): Promise<void> {
+		if (adoptions.length === 0) {
+			return;
+		}
+		let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+		const budgetExpired = new Promise<"budget">((resolveBudget) => {
+			budgetTimer = setTimeout(() => resolveBudget("budget"), WORKER_ADOPTION_STARTUP_BUDGET_MS);
+		});
+		try {
+			const outcome = await Promise.race([Promise.all(adoptions).then(() => "adopted" as const), budgetExpired]);
+			if (outcome === "budget") {
+				const pending = [...adopting].map((worker) => worker.descriptor.workerId);
+				this.log(
+					`Continuing daemon supervisor startup with ${pending.length} worker(s) still recovering ` +
+						`after ${WORKER_ADOPTION_STARTUP_BUDGET_MS}ms: ${pending.join(", ")}`,
+				);
+			}
+		} finally {
+			clearTimeout(budgetTimer);
 		}
 	}
 

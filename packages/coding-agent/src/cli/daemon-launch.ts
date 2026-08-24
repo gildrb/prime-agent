@@ -15,7 +15,11 @@ import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
-import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
+import {
+	DAEMON_SUPERVISOR_SOCKET_BUSY_EXIT_CODE,
+	defaultDaemonSocketPath,
+	normalizeSocketPath,
+} from "../modes/daemon/daemon-socket.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -393,6 +397,9 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	});
 	child.unref();
 
+	const lostSocketPathToRival = (failure: NonNullable<typeof childFailure>): boolean =>
+		failure.type === "exit" && failure.code === DAEMON_SUPERVISOR_SOCKET_BUSY_EXIT_CODE;
+
 	const throwIfFailed = () => {
 		if (!childFailure) {
 			return;
@@ -400,6 +407,12 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 		const logTail = readDaemonLogTail(socketPath, logOffset);
 		if (childFailure.type === "error") {
 			throw new Error(`Failed to spawn Prime Agent daemon: ${childFailure.error.message}.${logTail}`);
+		}
+		if (lostSocketPathToRival(childFailure)) {
+			throw new Error(
+				`Prime Agent daemon could not take ${socketPath}: another supervisor holds it but never finished ` +
+					`starting.${logTail}`,
+			);
 		}
 		const signal = childFailure.signal ? `, signal ${childFailure.signal}` : "";
 		throw new Error(
@@ -409,7 +422,9 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 
 	// A child exit is not immediately fatal: it may have lost the socket to a
 	// concurrent launcher whose daemon is still booting. Keep probing for a
-	// short grace window before attributing the failure to the exit.
+	// short grace window before attributing the failure to the exit -- and for
+	// the whole startup window when the child told us outright that it lost the
+	// socket-path lock, since the rival still has to finish adopting workers.
 	const deadline = Date.now() + DAEMON_STARTUP_TIMEOUT_MS;
 	let exitDeadline: number | undefined;
 	while (Date.now() < Math.min(deadline, exitDeadline ?? Number.POSITIVE_INFINITY)) {
@@ -417,7 +432,7 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 		if (started.status === "current") {
 			return;
 		}
-		if (childFailure) {
+		if (childFailure && !lostSocketPathToRival(childFailure)) {
 			exitDeadline ??= Date.now() + DAEMON_STARTUP_EXIT_GRACE_MS;
 		}
 		await delay(25);
