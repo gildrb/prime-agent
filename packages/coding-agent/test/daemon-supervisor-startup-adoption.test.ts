@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -89,7 +89,44 @@ describe("daemon supervisor startup adoption", () => {
 			supervisor.catalog = { start: async () => {}, list: async () => [] };
 			cleanups.push(() => supervisor.cleanupSupervisorResources());
 
-			await supervisor.start();
+			const startup = supervisor.start();
+
+			// A client that arrives mid-adoption must be greeted. daemon_hello is the
+			// only signal that separates a booting supervisor from a stale one, and a
+			// client that reads "stale" shuts this supervisor down and spawns a rival.
+			// Retry the connect: start() reaches listen() asynchronously.
+			const greeting = (async (): Promise<Record<string, unknown>> => {
+				const deadline = Date.now() + 60_000;
+				while (Date.now() < deadline) {
+					const line = await new Promise<string | undefined>((resolveLine) => {
+						const probe = createConnection(socketPath);
+						cleanups.push(() => {
+							probe.destroy();
+						});
+						let buffered = "";
+						const finish = (value?: string) => {
+							probe.destroy();
+							resolveLine(value);
+						};
+						probe.once("error", () => finish());
+						probe.once("close", () => finish());
+						probe.on("data", (chunk) => {
+							buffered += String(chunk);
+							const newline = buffered.indexOf("\n");
+							if (newline !== -1) finish(buffered.slice(0, newline));
+						});
+					});
+					if (line) return JSON.parse(line) as Record<string, unknown>;
+					await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+				}
+				throw new Error("supervisor sent no daemon_hello");
+			})();
+			const greetedDuringStartup = await Promise.race([greeting.then(() => true), startup.then(() => false)]);
+
+			await startup;
+
+			expect(greetedDuringStartup).toBe(true);
+			expect(await greeting).toMatchObject({ type: "daemon_hello", socketPath });
 
 			// Without the startup budget, start() awaited the full ladder: the
 			// supervisor held the exclusive socket-path lock and withheld

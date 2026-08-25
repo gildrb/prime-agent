@@ -55,6 +55,7 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 function createHarness(
 	options: {
 		ready?: Promise<void>;
+		greetable?: Promise<void>;
 		assertCurrent?: () => Promise<void>;
 		findWorker?: (client: DaemonSocketClient, selector: string) => Promise<unknown>;
 		forwardToWorker?: (worker: unknown, command: DaemonCommand) => Promise<DaemonResponse>;
@@ -69,6 +70,7 @@ function createHarness(
 ): SupervisorHarness {
 	return Object.assign(Object.create(DaemonSupervisor.prototype), {
 		ready: options.ready ?? Promise.resolve(),
+		greetable: options.greetable ?? Promise.resolve(),
 		ownership: {
 			assertCurrent: options.assertCurrent ?? vi.fn(async () => undefined),
 			record: { token: "test-owner", processStartId: "test-process", socketPath: "/tmp/test.sock" },

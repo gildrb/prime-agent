@@ -632,6 +632,9 @@ export class DaemonSupervisor {
 	private readonly ready: Promise<void>;
 	private markReady: () => void = () => {};
 	private rejectReady: (error: Error) => void = () => {};
+	/** Resolves once the socket is ours, which is when clients may be greeted. */
+	private readonly greetable: Promise<void>;
+	private markGreetable: () => void = () => {};
 	private ownsSocketPath = false;
 	private socketIdentity?: DaemonSocketIdentity;
 	private socketLease?: DaemonSocketPathLease;
@@ -677,6 +680,9 @@ export class DaemonSupervisor {
 			this.rejectReady = rejectReady;
 		});
 		void this.ready.catch(() => undefined);
+		this.greetable = new Promise<void>((resolveGreetable) => {
+			this.markGreetable = resolveGreetable;
+		});
 		const agentDir = options.defaultSessionConfig.agentDir;
 		if (!agentDir) {
 			throw new Error("Daemon supervisor config is missing agentDir");
@@ -726,6 +732,7 @@ export class DaemonSupervisor {
 			}
 			this.ownsSocketPath = true;
 			restrictDaemonSocketPath(this.socketPath);
+			this.markGreetable();
 
 			this.registerSignalHandlers();
 			const ownedSessionFiles = new Set(
@@ -1161,29 +1168,37 @@ export class DaemonSupervisor {
 		this.sessionInputPauseEpochs.set(client, 0);
 		this.detachingInputPauseSessions.set(client, new Set());
 		this.clients.add(client);
-		void this.ready.then(
-			() => {
-				if (!client.socket.destroyed && this.clients.has(client)) {
-					this.write(client, {
-						type: "daemon_hello",
-						socketPath: this.socketPath,
-						protocol: DAEMON_PROTOCOL_INFO,
-						schemaId: DAEMON_SCHEMA_ID,
-						schemaRevision: DAEMON_SCHEMA_REVISION,
-						appVersion: VERSION,
-						runtime: getDaemonRuntimeIdentity(),
-						supervisorGeneration: this.generation,
-						supervisorOwnerToken: this.ownership?.record.token,
-						supervisorPid: process.pid,
-						supervisorProcessStartId: this.ownership?.record.processStartId,
-						supervisorSocketPath: this.ownership?.record.socketPath,
-						clientId: client.id,
-						serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
-					});
-				}
-			},
-			() => client.socket.destroy(),
-		);
+		// Greet as soon as the socket path is ours, not when startup finishes.
+		// daemon_hello is how a client tells a live daemon from a dead one, and every
+		// field in it is already known here. Withholding it until adoption completed
+		// made a booting supervisor indistinguishable from a stale one: probing
+		// clients timed out waiting for the greeting, declared the daemon stale, tried
+		// to shut it down, and spawned a replacement that inherited the same problem.
+		// Commands stay gated on this.ready in handleLine, so an early greeting still
+		// cannot race work ahead of a supervisor that is not serving yet.
+		void this.greetable.then(() => {
+			if (!client.socket.destroyed && this.clients.has(client)) {
+				this.write(client, {
+					type: "daemon_hello",
+					socketPath: this.socketPath,
+					protocol: DAEMON_PROTOCOL_INFO,
+					schemaId: DAEMON_SCHEMA_ID,
+					schemaRevision: DAEMON_SCHEMA_REVISION,
+					appVersion: VERSION,
+					runtime: getDaemonRuntimeIdentity(),
+					supervisorGeneration: this.generation,
+					supervisorOwnerToken: this.ownership?.record.token,
+					supervisorPid: process.pid,
+					supervisorProcessStartId: this.ownership?.record.processStartId,
+					supervisorSocketPath: this.ownership?.record.socketPath,
+					clientId: client.id,
+					serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+				});
+			}
+		});
+		// A startup that fails after listening still owes every greeted client a
+		// disconnect rather than a socket that answers nothing.
+		void this.ready.catch(() => client.socket.destroy());
 
 		client.detachInput = attachJsonlLineReader(socket, (line) => void this.handleLine(client, line));
 		let cleaned = false;
