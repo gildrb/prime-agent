@@ -151,6 +151,20 @@ const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // an abandoned prepare leaves the daemon permanently fenced with workers stopped.
 const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
+// A worker is only really gone when its process is gone. Every IPC timeout that
+// writes one off is circumstantial: a host that suspended, a VM that paused, or
+// a machine loaded enough to blow a 5s timeout freezes a perfectly healthy
+// worker for longer than the whole retry ladder, and the ladder then marks it
+// failed on the strength of that. Failed is otherwise terminal -- nothing
+// re-checks it -- so every session the worker holds stays unreachable until the
+// supervisor restarts. Keep probing while the process is alive and its start id
+// still matches, backing off but never giving up on a process that exists.
+// Bounded, because each probe that fails costs the full retry ladder again, and
+// a worker that is alive but permanently deaf must not be retried forever. The
+// budget is spent in attempts rather than wall-clock on purpose: a suspended
+// host freezes these timers too, so a sleep of any length consumes nothing and
+// the first attempt after the wake is the one that finds the worker answering.
+const FAILED_WORKER_REPROBE_DELAYS_MS = [5_000, 10_000, 30_000, 60_000, 60_000, 60_000, 60_000, 60_000] as const;
 // A worker that is alive but no longer answering IPC costs ~30s to adopt and
 // then walk the recovery ladder. start() holds the exclusive socket-path lock
 // for its whole duration and no client completes the daemon_hello handshake
@@ -295,6 +309,7 @@ interface ResidentWorker {
 	snapshotLoads: Map<string, Promise<DaemonAttachResult>>;
 	recovery?: Promise<void>;
 	deferredRecovery?: Promise<void>;
+	failedReprobe?: Promise<void>;
 	intentionalStop: boolean;
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
@@ -3276,6 +3291,74 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/**
+	 * True only when the worker's process still exists and is provably the one we
+	 * launched. An unrecorded or unreadable start id is not good enough: a pid can
+	 * be recycled into an unrelated process, and the rest of the supervisor
+	 * already refuses to act on a live worker it cannot identify.
+	 */
+	private isWorkerProcessIdentityIntact(worker: ResidentWorker): boolean {
+		if (worker.descriptor.processStartId === undefined || !isProcessAlive(worker.descriptor.pid)) {
+			return false;
+		}
+		return getProcessStartId(worker.descriptor.pid) === worker.descriptor.processStartId;
+	}
+
+	/**
+	 * Keep retrying a failed worker for as long as its process is alive and still
+	 * carries the start id we recorded. A worker that only looked dead -- because
+	 * the host slept through the retry ladder, or stalled past a timeout -- is
+	 * adopted again the moment it answers, and its sessions become reachable
+	 * without a supervisor restart. A worker whose process is genuinely gone, or
+	 * whose pid was recycled into someone else's process, keeps its terminal
+	 * failed state and stops being probed.
+	 */
+	private scheduleFailedWorkerReprobe(worker: ResidentWorker): void {
+		if (worker.failedReprobe) {
+			return;
+		}
+		worker.failedReprobe = (async () => {
+			for (const reprobeDelay of FAILED_WORKER_REPROBE_DELAYS_MS) {
+				await unrefDelay(reprobeDelay);
+				if (this.shuttingDown || !this.isWorkerRecoveryCandidate(worker)) {
+					return;
+				}
+				// Something else already picked it up, or it is on its way out.
+				if (worker.descriptor.lifecycle !== "failed" || worker.recovery) {
+					return;
+				}
+				if (!this.isWorkerProcessIdentityIntact(worker)) {
+					return;
+				}
+				try {
+					await this.assertRecoveryAllowed();
+				} catch (error) {
+					if (isSupervisorGenerationStale(error)) {
+						return;
+					}
+					continue;
+				}
+				worker.descriptor.lifecycle = "recovering";
+				this.persistWorker(worker);
+				await this.recoverWorker(worker).catch(() => undefined);
+				// A reconnected client is the signal that adoption took: recoverWorker
+				// sets it alongside the ready lifecycle on its success path.
+				if (worker.client) {
+					this.log(`Recovered worker ${worker.descriptor.workerId} after its process started answering again`);
+					return;
+				}
+			}
+			if (this.isWorkerRecoveryCandidate(worker) && this.isWorkerProcessIdentityIntact(worker)) {
+				this.log(
+					`Stopped re-probing worker ${worker.descriptor.workerId} after ` +
+						`${FAILED_WORKER_REPROBE_DELAYS_MS.length} attempts; its process is alive but not answering`,
+				);
+			}
+		})().finally(() => {
+			worker.failedReprobe = undefined;
+		});
+	}
+
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
 		if (this.isWorkerRecoveryCancelled(worker)) {
 			return;
@@ -3345,6 +3428,7 @@ export class DaemonSupervisor {
 						worker.descriptor.lifecycle = "failed";
 						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
 						this.persistWorker(worker);
+						this.scheduleFailedWorkerReprobe(worker);
 						return;
 					}
 					const safeToKillWorkerProcess =
@@ -3380,6 +3464,7 @@ export class DaemonSupervisor {
 			worker.descriptor.lifecycle = "failed";
 			this.persistWorker(worker);
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
+			this.scheduleFailedWorkerReprobe(worker);
 		})().finally(() => {
 			worker.recovery = undefined;
 		});
