@@ -87,6 +87,11 @@ function makeWorker(id: string, summaries: SessionSummary[]): WorkerFixture {
 	};
 }
 
+function seedSupervisorRoster(supervisor: SupervisorInternals, ...workers: WorkerFixture[]): void {
+	const internals = supervisor as unknown as { syncWorkerSummariesIntoRoster(worker: WorkerFixture): void };
+	for (const worker of workers) internals.syncWorkerSummariesIntoRoster(worker);
+}
+
 function makeSupervisor(idleEvictionMinutes: number | "off" = 90): SupervisorInternals {
 	const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-eviction-"));
 	tempDirs.push(directory);
@@ -283,7 +288,10 @@ describe("daemon supervisor whole-tree eviction", () => {
 		});
 		const reopened = makeWorker("reopened", [rootSummary]);
 		reopened.descriptor.rootActiveSessionId = "new-active-id";
-		supervisor.createOrReuseWorker = vi.fn(async () => reopened);
+		supervisor.createOrReuseWorker = vi.fn(async () => {
+			seedSupervisorRoster(supervisor, reopened);
+			return reopened;
+		});
 		const client = { id: "viewer", attachedActiveSessionIds: new Set<string>() };
 
 		const response = await supervisor.handleCommand(client, {
@@ -368,6 +376,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 			data: { deliveryStatus: "delivered" },
 		});
 		supervisor.workers.set("shared", worker);
+		seedSupervisorRoster(supervisor, worker);
 		const client = { id: "sender", attachedActiveSessionIds: new Set<string>() };
 
 		const response = await supervisor.handleCommand(client, {
@@ -400,6 +409,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 		const supervisor = makeSupervisor();
 		const source = makeWorker("source", [makeSummary("source-active", now)]);
 		supervisor.workers.set("source", source);
+		seedSupervisorRoster(supervisor, source);
 		supervisor.catalog.resolve = vi.fn(async () => {
 			throw new Error("Unknown saved session: missing-target");
 		});
