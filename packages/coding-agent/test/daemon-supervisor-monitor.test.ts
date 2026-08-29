@@ -280,7 +280,15 @@ function seedSupervisorRoster(
 ): void {
 	const internals = supervisor as {
 		writeRosterEntry(entry: ReturnType<typeof workerRosterEntryFromSummary>, worker?: object): unknown;
+		clients?: Set<unknown>;
 	};
+	// Prototype-based fixtures skip field initializers; give the push buffers real containers.
+	Object.assign(internals, {
+		pendingRosterChanged: new Set(),
+		pendingRosterRemoved: new Set(),
+		rosterPushScheduled: false,
+		clients: internals.clients ?? new Set(),
+	});
 	for (const worker of workers) {
 		for (const summary of worker.summaries.values()) {
 			internals.writeRosterEntry(workerRosterEntryFromSummary(summary), worker);
