@@ -1,2 +1,3 @@
 - Fixed daemon startup lock contention to name the busy socket and make losing launchers wait for the winning supervisor instead of failing the user command.
 - Fixed clients mistaking a booting supervisor for a stale daemon by sending `daemon_hello` as soon as socket ownership is established while keeping commands gated on complete worker adoption.
+- Fixed a command sent during adoption still running after its client timed out and disconnected. Startup-gated commands now confirm their socket is still registered before command or journal admission.

@@ -36,10 +36,9 @@ import {
 } from "../../core/cron-jobs.js";
 import {
 	clearOrphanProcessJournal,
-	killOrphanProcess,
 	ORPHAN_PROCESS_JOURNAL_ENV,
 	readActiveOrphanProcesses,
-	shouldReapOrphanProcess,
+	reapOrphanProcess,
 } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import {
@@ -156,7 +155,8 @@ const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 // healthy worker longer than the retry ladder. Keep probing while its process
 // may still be the recorded worker. Cap the cadence, not the attempt count, so a
 // long pause cannot make otherwise-live sessions permanently unreachable.
-const FAILED_WORKER_REPROBE_DELAYS_MS = [5_000, 10_000, 30_000, 60_000, 120_000, 300_000] as const;
+const FAILED_WORKER_REPROBE_DELAYS_MS = [5_000, 10_000, 30_000] as const;
+const WORKER_SUBSCRIBE_TIMEOUT_MS = 3_000;
 /**
  * Recovery needs the authoritative roster, including passive descendants. Its
  * scan can be slower than a live refresh; timing out never proves worker death.
@@ -497,6 +497,20 @@ function sessionSummariesFromResponse(response: DaemonResponse): SessionSummary[
 	return sessions;
 }
 
+function isWorkerAdoptionProbeTimeout(error: unknown): boolean {
+	return (
+		error instanceof DaemonWorkerRequestTimeoutError &&
+		(error.command === "worker_subscribe" || error.command === "list")
+	);
+}
+
+function isSupervisorClientDisconnected(
+	client: DaemonSocketClient,
+	clients: ReadonlySet<DaemonSocketClient> | undefined,
+): boolean {
+	return client.socket?.destroyed === true || (client.socket !== undefined && clients?.has(client) === false);
+}
+
 function attachResultFromResponse(response: DaemonResponse): DaemonAttachResult {
 	if (!response.success || !response.data || typeof response.data !== "object") {
 		throw new Error(response.success ? "Session worker returned an invalid attach response" : response.error);
@@ -699,7 +713,7 @@ export class DaemonSupervisor {
 			this.loadPersistedSupervisorConfig(),
 		);
 		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
-		this.catalog = new DaemonCatalogClient((message) => this.log(message));
+		this.catalog = new DaemonCatalogClient((message) => this.log(message), getDaemonLogPath(this.socketPath));
 		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
 	}
 
@@ -1488,6 +1502,10 @@ export class DaemonSupervisor {
 			this.write(client, failure(command.id, command.type, error));
 			return;
 		}
+		if (isSupervisorClientDisconnected(client, this.clients)) {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			return;
+		}
 		const envelopeClientId = preParsed.envelopeClientId;
 		if (envelopeClientId) {
 			this.protocolClientIds.set(client, envelopeClientId);
@@ -1518,6 +1536,10 @@ export class DaemonSupervisor {
 		} catch (error) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			this.write(client, failure(command.id, command.type, error));
+			return;
+		}
+		if (isSupervisorClientDisconnected(client, this.clients)) {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			return;
 		}
 
@@ -2893,14 +2915,17 @@ export class DaemonSupervisor {
 		const supportsExtensionUi = [...this.clients].some(
 			(client) => client.attachedActiveSessionIds.has(activeSessionId) && client.supportsExtensionUi,
 		);
-		const response = await worker.client.requestWorker({
-			type: "worker_subscribe",
-			activeSessionId,
-			capabilities: supportsExtensionUi
-				? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
-				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
-			supportsExtensionUi,
-		});
+		const response = await worker.client.requestWorker(
+			{
+				type: "worker_subscribe",
+				activeSessionId,
+				capabilities: supportsExtensionUi
+					? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
+					: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+				supportsExtensionUi,
+			},
+			WORKER_SUBSCRIBE_TIMEOUT_MS,
+		);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
@@ -2964,7 +2989,7 @@ export class DaemonSupervisor {
 			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
 			worker.client?.close();
 			worker.client = undefined;
-			if (error instanceof DaemonWorkerRequestTimeoutError && error.command === "list") {
+			if (isWorkerAdoptionProbeTimeout(error)) {
 				try {
 					await this.assertRecoveryAllowed();
 				} catch {
@@ -3400,14 +3425,14 @@ export class DaemonSupervisor {
 							await this.assertRecoveryAllowed();
 							worker.client?.close();
 							worker.client = undefined;
-							const authoritativeRosterTimedOut =
-								error instanceof DaemonWorkerRequestTimeoutError && error.command === "list";
-							// A timed-out list scan can still be running in the worker. Do not
-							// multiply that expensive scan with the immediate retry ladder.
-							if (authoritativeRosterTimedOut && this.preserveUnresponsiveWorkerIfLive(worker)) {
+							const adoptionProbeTimedOut = isWorkerAdoptionProbeTimeout(error);
+							// A timed-out list scan can still be running in the worker, and a
+							// timed-out subscription gives no evidence that the worker died.
+							// Defer either probe instead of multiplying it with this retry ladder.
+							if (adoptionProbeTimedOut && this.preserveUnresponsiveWorkerIfLive(worker)) {
 								return;
 							}
-							if (!authoritativeRosterTimedOut && retryIndex < WORKER_RETRY_DELAYS_MS.length - 1) {
+							if (!adoptionProbeTimedOut && retryIndex < WORKER_RETRY_DELAYS_MS.length - 1) {
 								throw error;
 							}
 						}
@@ -3517,10 +3542,7 @@ export class DaemonSupervisor {
 		if (orphanProcessJournalPath) {
 			try {
 				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
-					if (!shouldReapOrphanProcess(orphan)) {
-						continue;
-					}
-					killOrphanProcess(orphan.pid);
+					reapOrphanProcess(orphan);
 				}
 				clearOrphanProcessJournal(orphanProcessJournalPath);
 			} catch (error) {

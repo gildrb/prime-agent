@@ -2051,6 +2051,63 @@ describe("daemon worker supervisor monitoring", () => {
 		},
 	);
 
+	it("defers a live worker after one timed-out recovery subscription", async () => {
+		vi.useFakeTimers();
+		const client = { close: vi.fn() };
+		const worker = {
+			descriptor: {
+				workerId: "subscribe-timeout",
+				pid: process.pid,
+				processStartId: getProcessStartId(process.pid),
+				rootActiveSessionId: "active-1",
+				lifecycle: "recovering",
+				consecutiveFailures: 0,
+				createCommand: { type: "create" as const },
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+			client: undefined as typeof client | undefined,
+		};
+		const connectWorker = vi.fn(async () => {
+			worker.client = client;
+			return client;
+		});
+		const subscribeWorker = vi.fn(async () => {
+			throw new DaemonWorkerRequestTimeoutError("worker_subscribe");
+		});
+		const refreshWorkerSummaries = vi.fn();
+		const recoverUncertainWorkerOperations = vi.fn();
+		const launchWorker = vi.fn();
+		const scheduleFailedWorkerReprobe = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			connectWorker,
+			subscribeWorker,
+			refreshWorkerSummaries,
+			recoverUncertainWorkerOperations,
+			launchWorker,
+			persistWorker: vi.fn(),
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			processIdentity: vi.fn(() => "current"),
+			scheduleFailedWorkerReprobe,
+		}) as {
+			recoverWorker(target: typeof worker): Promise<void>;
+		};
+
+		const recovery = supervisor.recoverWorker(worker);
+		await vi.advanceTimersByTimeAsync(250);
+		await recovery;
+
+		expect(connectWorker).toHaveBeenCalledOnce();
+		expect(subscribeWorker).toHaveBeenCalledOnce();
+		expect(refreshWorkerSummaries).not.toHaveBeenCalled();
+		expect(recoverUncertainWorkerOperations).not.toHaveBeenCalled();
+		expect(launchWorker).not.toHaveBeenCalled();
+		expect(worker.descriptor.lifecycle).toBe("recovering");
+		expect(scheduleFailedWorkerReprobe).toHaveBeenCalledWith(worker);
+	});
+
 	it("reports a stop-tombstoned worker as stopping, not ready", () => {
 		const worker = {
 			descriptor: {
@@ -3696,12 +3753,15 @@ describe("daemon worker supervisor monitoring", () => {
 
 		await supervisor.subscribeWorker(worker, "active-1");
 
-		expect(requestWorker).toHaveBeenCalledWith({
-			type: "worker_subscribe",
-			activeSessionId: "active-1",
-			capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
-			supportsExtensionUi: false,
-		});
+		expect(requestWorker).toHaveBeenCalledWith(
+			{
+				type: "worker_subscribe",
+				activeSessionId: "active-1",
+				capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+				supportsExtensionUi: false,
+			},
+			3_000,
+		);
 	});
 
 	it("does not retain an attachment when snapshot loading fails", async () => {

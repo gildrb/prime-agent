@@ -1,11 +1,14 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
+import { appendRotatingLog } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import { installDaemonCrashHandlers } from "./daemon-crash-handlers.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
+export const DAEMON_CATALOG_LOG_PATH_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG_LOG_PATH";
 
 interface SessionInfoWire extends Omit<SessionInfo, "created" | "modified"> {
 	created: string;
@@ -108,6 +111,12 @@ export function isDaemonCatalogProcess(environment: NodeJS.ProcessEnv = process.
 }
 
 export async function runDaemonCatalogProcess(): Promise<never> {
+	installDaemonCrashHandlers((message) => {
+		const logPath = process.env[DAEMON_CATALOG_LOG_PATH_ENV];
+		if (logPath) {
+			appendRotatingLog(logPath, `[${new Date().toISOString()}] catalog: ${message}`);
+		}
+	});
 	process.on("disconnect", () => process.exit(0));
 	process.on("message", (value: unknown) => {
 		if (!isCatalogRequest(value)) {
@@ -243,7 +252,10 @@ export class DaemonCatalogClient {
 		}
 	>();
 
-	constructor(private readonly onDiagnostic: (message: string) => void) {}
+	constructor(
+		private readonly onDiagnostic: (message: string) => void,
+		private readonly crashLogPath?: string,
+	) {}
 
 	async start(): Promise<void> {
 		if (this.child?.connected) {
@@ -322,7 +334,11 @@ export class DaemonCatalogClient {
 		const launch = createCliSubprocessLaunchSpec(["--version"]);
 		const child = spawn(launch.command, launch.args, {
 			cwd: process.cwd(),
-			env: createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" }),
+			env: createCliSubprocessEnv({
+				...process.env,
+				[DAEMON_CATALOG_ROLE_ENV]: "1",
+				...(this.crashLogPath ? { [DAEMON_CATALOG_LOG_PATH_ENV]: this.crashLogPath } : {}),
+			}),
 			stdio: ["ignore", "ignore", "ignore", "ipc"],
 		});
 		this.child = child;

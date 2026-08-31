@@ -125,6 +125,29 @@ describe("daemon supervisor prompt admission ownership", () => {
 		expect(handleCommand).toHaveBeenCalledOnce();
 		socket.emit("close");
 	});
+
+	it("drops a create whose client disconnects before readiness", async () => {
+		const ready = deferred<void>();
+		const supervisor = createHarness({ ready: ready.promise });
+		const handleCommand = vi.fn(async () => success("create-1", "create"));
+		(supervisor as unknown as { handleCommand: typeof handleCommand }).handleCommand = handleCommand;
+		const socket = new PassThrough() as unknown as Socket;
+		Object.assign(socket, { destroyed: false });
+		supervisor.handleConnection(socket);
+		await waitFor(() => supervisor.clients.size === 1);
+		const owner = [...supervisor.clients][0]!;
+		const pendingCreate = supervisor.handleLine(
+			owner,
+			commandLine({ id: "create-1", type: "create" } satisfies DaemonCommand),
+		);
+
+		socket.emit("close");
+		ready.resolve();
+		await pendingCreate;
+
+		expect(handleCommand).not.toHaveBeenCalled();
+		expect(supervisor.clients).not.toContain(owner);
+	});
 	it("registers a prompt synchronously before readiness and ownership awaits", async () => {
 		const ready = deferred<void>();
 		const ownership = deferred<void>();

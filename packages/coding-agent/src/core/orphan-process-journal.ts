@@ -100,17 +100,8 @@ export function isOrphanProcessIdentityCurrent(orphan: ActiveOrphanProcess): boo
 	return orphan.processStartId !== undefined && getProcessStartId(orphan.pid) === orphan.processStartId;
 }
 
-/**
- * Identity-free records cannot prove the pid still names the journaled process.
- * On win32 the kernel's kill-on-close job already reaped its tree when it died,
- * so a bare-pid taskkill only risks killing a reused pid. POSIX keeps the
- * best-effort kill (group-scoped, and the spawn gate makes pid-only actives
- * host-written rarities there).
- */
+/** Identity-free records can never authorize a signal on any platform. */
 export function shouldReapOrphanProcess(orphan: ActiveOrphanProcess): boolean {
-	if (orphan.processStartId === undefined) {
-		return process.platform !== "win32";
-	}
 	return isOrphanProcessIdentityCurrent(orphan);
 }
 
@@ -134,20 +125,29 @@ export function reapKernelOrphanProcesses(kernelPid: number): void {
 		if (orphan.kernelPid !== kernelPid || orphan.pid === kernelPid) {
 			continue;
 		}
-		if (!shouldReapOrphanProcess(orphan)) {
-			continue;
-		}
-		// Inactive only after a delivered signal; a stale record is neutralized by the startId check.
-		if (killOrphanProcess(orphan.pid)) {
+		if (reapOrphanProcess(orphan)) {
 			recordOrphanProcessState(orphan.pid, false);
 		}
 	}
 }
 
+/**
+ * Re-check identity in the same synchronous operation that sends the signal.
+ * A legacy pid-only record is deliberately leaked rather than risking a reused
+ * pid. Node has no portable pidfd, so callers must not split this check from the
+ * kill with their own asynchronous work.
+ */
+export function reapOrphanProcess(orphan: ActiveOrphanProcess): boolean {
+	if (!shouldReapOrphanProcess(orphan)) {
+		return false;
+	}
+	return killOrphanProcess(orphan.pid);
+}
+
 // Hardened cross-platform tree kill for journaled orphans: absolute System32
 // taskkill /T on win32 (a bare name could resolve a planted CWD taskkill.exe),
 // process-group then pid SIGKILL elsewhere.
-export function killOrphanProcess(pid: number): boolean {
+function killOrphanProcess(pid: number): boolean {
 	if (process.platform === "win32") {
 		// In-kernel bash() kill paths use taskkill /T; the reaper must kill the same tree, not just the shell pid.
 		const result = spawnSync(

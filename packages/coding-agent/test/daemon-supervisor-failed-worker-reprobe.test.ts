@@ -49,8 +49,10 @@ describe("failed worker re-probe", () => {
 			intentionalStop: false,
 		};
 		let attempts = 0;
+		const attemptTimes: number[] = [];
 		const recoverWorker = vi.fn(async (target: RecoveryWorker) => {
 			attempts++;
+			attemptTimes.push(Date.now());
 			if (attempts === 9) {
 				target.client = {};
 				target.descriptor.lifecycle = "ready";
@@ -77,6 +79,8 @@ describe("failed worker re-probe", () => {
 		await reprobe;
 
 		expect(recoverWorker).toHaveBeenCalledTimes(9);
+		const reprobeGaps = attemptTimes.slice(1).map((time, index) => time - attemptTimes[index]!);
+		expect(Math.max(...reprobeGaps)).toBeLessThanOrEqual(30_000);
 		expect(worker.descriptor.lifecycle).toBe("ready");
 		expect(worker.client).toBeDefined();
 	});
