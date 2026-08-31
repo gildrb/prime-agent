@@ -1,0 +1,416 @@
+name: Sync daemon durability
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-daemon-durability
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  INTEGRATION_BRANCH: daemon-durability
+  MIRROR_BRANCH: upstream-main
+  PATCH_BASE_TAG: daemon-durability-base
+  UPSTREAM_BRANCH: main
+  UPSTREAM_REPOSITORY: PrimeIntellect-ai/prime-agent
+
+jobs:
+  sync:
+    name: Mirror, rebase, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      failure_phase: ${{ steps.outcome.outputs.failure_phase }}
+      integration_sha: ${{ steps.refs.outputs.integration_sha }}
+      patch_base_sha: ${{ steps.refs.outputs.patch_base_sha }}
+      upstream_sha: ${{ steps.refs.outputs.upstream_sha }}
+    steps:
+      - name: Checkout integration branch
+        id: checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: daemon-durability
+
+      - name: Fetch refs and update the exact mirror
+        id: refs
+        env:
+          CONTENTS_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_REPOSITORY" != "gildrb/prime-agent" ]; then
+            echo "Refusing to update branches outside gildrb/prime-agent." >&2
+            exit 1
+          fi
+          if [ "$DEFAULT_BRANCH" != "$INTEGRATION_BRANCH" ]; then
+            echo "The fork default branch must be ${INTEGRATION_BRANCH} so scheduled runs use this workflow." >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config commit.gpgsign false
+
+          git fetch --no-tags --force origin \
+            "refs/heads/${INTEGRATION_BRANCH}:refs/remotes/origin/${INTEGRATION_BRANCH}" \
+            "refs/heads/${MIRROR_BRANCH}:refs/remotes/origin/${MIRROR_BRANCH}"
+          git fetch --no-tags --force \
+            "https://github.com/${UPSTREAM_REPOSITORY}.git" \
+            "refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          integration_sha=$(git rev-parse "refs/remotes/origin/${INTEGRATION_BRANCH}^{commit}")
+          previous_mirror_sha=$(git rev-parse "refs/remotes/origin/${MIRROR_BRANCH}^{commit}")
+          upstream_sha=$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}^{commit}")
+
+          set +e
+          marker_listing=$(git ls-remote --exit-code --refs origin "refs/tags/${PATCH_BASE_TAG}")
+          marker_status=$?
+          set -e
+          case "$marker_status" in
+            0)
+              marker_ref_oid=${marker_listing%%[[:space:]]*}
+              git fetch --force origin "refs/tags/${PATCH_BASE_TAG}:refs/tags/${PATCH_BASE_TAG}"
+              patch_base_sha=$(git rev-parse "refs/tags/${PATCH_BASE_TAG}^{commit}")
+              marker_lease_oid=$marker_ref_oid
+              bootstrap_marker=false
+              ;;
+            2)
+              patch_base_sha=$previous_mirror_sha
+              marker_lease_oid=$patch_base_sha
+              bootstrap_marker=true
+              ;;
+            *)
+              echo "Could not read ${PATCH_BASE_TAG} from origin." >&2
+              exit "$marker_status"
+              ;;
+          esac
+
+          if ! git merge-base --is-ancestor "$patch_base_sha" "$integration_sha"; then
+            echo "${PATCH_BASE_TAG} is not an ancestor of ${INTEGRATION_BRANCH}; refusing to guess the patch range." >&2
+            exit 1
+          fi
+          if git rev-list --merges --max-count=1 "${patch_base_sha}..${integration_sha}" | grep -q .; then
+            echo "The durability patch range contains a merge commit; refusing a lossy linear replay." >&2
+            exit 1
+          fi
+          patch_count=$(git rev-list --count "${patch_base_sha}..${integration_sha}")
+          if [ "$patch_count" -eq 0 ]; then
+            echo "The durability patch range is empty; refusing to replace the integration branch." >&2
+            exit 1
+          fi
+
+          {
+            echo "integration_sha=$integration_sha"
+            echo "marker_lease_oid=$marker_lease_oid"
+            echo "patch_base_sha=$patch_base_sha"
+            echo "upstream_sha=$upstream_sha"
+          } >> "$GITHUB_OUTPUT"
+
+          auth_header=$(printf 'x-access-token:%s' "$CONTENTS_TOKEN" | base64 | tr -d '\n')
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth_header}"
+
+          if [ "$bootstrap_marker" = true ]; then
+            git push --atomic \
+              --force-with-lease="refs/heads/${MIRROR_BRANCH}:${previous_mirror_sha}" \
+              --force-with-lease="refs/tags/${PATCH_BASE_TAG}:" \
+              origin \
+              "${upstream_sha}:refs/heads/${MIRROR_BRANCH}" \
+              "${patch_base_sha}:refs/tags/${PATCH_BASE_TAG}"
+          else
+            git push \
+              --force-with-lease="refs/heads/${MIRROR_BRANCH}:${previous_mirror_sha}" \
+              origin \
+              "${upstream_sha}:refs/heads/${MIRROR_BRANCH}"
+          fi
+
+          mirrored_sha=$(git ls-remote --refs origin "refs/heads/${MIRROR_BRANCH}" | cut -f1)
+          if [ "$mirrored_sha" != "$upstream_sha" ]; then
+            echo "${MIRROR_BRANCH} did not land on fetched upstream main." >&2
+            exit 1
+          fi
+
+          echo "Mirrored ${UPSTREAM_REPOSITORY}@${upstream_sha} to ${MIRROR_BRANCH}."
+          echo "Will replay ${patch_count} commits after ${patch_base_sha}."
+
+      - name: Replay durability commits in a temporary branch
+        id: rebase
+        env:
+          INTEGRATION_SHA: ${{ steps.refs.outputs.integration_sha }}
+          PATCH_BASE_SHA: ${{ steps.refs.outputs.patch_base_sha }}
+          UPSTREAM_SHA: ${{ steps.refs.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          git switch --create "durability-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "$INTEGRATION_SHA"
+          if ! git rebase --onto "$UPSTREAM_SHA" "$PATCH_BASE_SHA"; then
+            conflicts=$(git diff --name-only --diff-filter=U)
+            if [ -n "$conflicts" ]; then
+              {
+                echo "### Rebase conflicts"
+                printf '%s\n' "$conflicts" | sed 's/^/- `/' | sed 's/$/`/'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            git rebase --abort
+            exit 1
+          fi
+
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+          if git rev-list --merges --max-count=1 "${UPSTREAM_SHA}..HEAD" | grep -q .; then
+            echo "The rebased integration range is not linear." >&2
+            exit 1
+          fi
+          echo "candidate_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js and npm cache
+        id: setup_node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: npm
+          node-version: 22
+
+      - name: Install dependencies without lifecycle scripts
+        id: install
+        run: |
+          set -euo pipefail
+
+          if npm ci --ignore-scripts --offline; then
+            echo "Installed entirely from the restored npm cache."
+          else
+            echo "The restored npm cache was incomplete; retrying without offline mode."
+            npm ci --ignore-scripts
+          fi
+
+      - name: Check
+        id: check
+        run: |
+          set -euo pipefail
+          npm run check
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Run affected coding-agent Vitest files
+        id: tests
+        env:
+          UPSTREAM_SHA: ${{ steps.refs.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' affected_tests < <(
+            git diff --diff-filter=ACMR --name-only -z "${UPSTREAM_SHA}..HEAD" -- \
+              ':(glob)packages/coding-agent/test/**/*.test.ts'
+          )
+          if [ "${#affected_tests[@]}" -eq 0 ]; then
+            echo "No coding-agent Vitest files are changed by the durability patch range." >&2
+            exit 1
+          fi
+
+          package_tests=()
+          echo "### Affected Vitest files" | tee -a "$GITHUB_STEP_SUMMARY"
+          for test_path in "${affected_tests[@]}"; do
+            case "$test_path" in
+              packages/coding-agent/test/*.test.ts)
+                package_test=${test_path#packages/coding-agent/}
+                package_tests+=("$package_test")
+                echo "- \`${test_path}\`" | tee -a "$GITHUB_STEP_SUMMARY"
+                ;;
+              *)
+                echo "Unexpected test path: ${test_path}" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          cd packages/coding-agent
+          npx tsx ../../node_modules/vitest/dist/cli.js --run "${package_tests[@]}"
+
+      - name: Verify tested tree is unchanged
+        id: clean
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git diff --cached --exit-code
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          test "$(git rev-parse HEAD)" = "${{ steps.rebase.outputs.candidate_sha }}"
+
+      - name: Publish tested integration and advance its patch-base marker
+        id: publish
+        env:
+          CONTENTS_TOKEN: ${{ github.token }}
+          EXPECTED_INTEGRATION_SHA: ${{ steps.refs.outputs.integration_sha }}
+          EXPECTED_MARKER_OID: ${{ steps.refs.outputs.marker_lease_oid }}
+          UPSTREAM_SHA: ${{ steps.refs.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          auth_header=$(printf 'x-access-token:%s' "$CONTENTS_TOKEN" | base64 | tr -d '\n')
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth_header}"
+
+          remote_integration=$(git ls-remote --refs origin "refs/heads/${INTEGRATION_BRANCH}" | cut -f1)
+          remote_marker=$(git ls-remote --refs origin "refs/tags/${PATCH_BASE_TAG}" | cut -f1)
+          remote_mirror=$(git ls-remote --refs origin "refs/heads/${MIRROR_BRANCH}" | cut -f1)
+          test "$remote_integration" = "$EXPECTED_INTEGRATION_SHA"
+          test "$remote_marker" = "$EXPECTED_MARKER_OID"
+          test "$remote_mirror" = "$UPSTREAM_SHA"
+
+          git push --atomic \
+            --force-with-lease="refs/heads/${INTEGRATION_BRANCH}:${EXPECTED_INTEGRATION_SHA}" \
+            --force-with-lease="refs/heads/${MIRROR_BRANCH}:${UPSTREAM_SHA}" \
+            --force-with-lease="refs/tags/${PATCH_BASE_TAG}:${EXPECTED_MARKER_OID}" \
+            origin \
+            "HEAD:refs/heads/${INTEGRATION_BRANCH}" \
+            "${UPSTREAM_SHA}:refs/heads/${MIRROR_BRANCH}" \
+            "${UPSTREAM_SHA}:refs/tags/${PATCH_BASE_TAG}"
+
+          published_integration=$(git ls-remote --refs origin "refs/heads/${INTEGRATION_BRANCH}" | cut -f1)
+          published_marker=$(git ls-remote --refs origin "refs/tags/${PATCH_BASE_TAG}" | cut -f1)
+          test "$published_integration" = "$(git rev-parse HEAD)"
+          test "$published_marker" = "$UPSTREAM_SHA"
+
+      - name: Record outcome
+        id: outcome
+        if: always()
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          REFS_OUTCOME: ${{ steps.refs.outcome }}
+          REBASE_OUTCOME: ${{ steps.rebase.outcome }}
+          SETUP_NODE_OUTCOME: ${{ steps.setup_node.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          CLEAN_OUTCOME: ${{ steps.clean.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+        run: |
+          failure_phase=success
+          if [ "$CHECKOUT_OUTCOME" != success ]; then
+            failure_phase=checkout
+          elif [ "$REFS_OUTCOME" != success ]; then
+            failure_phase=mirror-or-topology
+          elif [ "$REBASE_OUTCOME" != success ]; then
+            failure_phase=rebase
+          elif [ "$SETUP_NODE_OUTCOME" != success ]; then
+            failure_phase=node-setup
+          elif [ "$INSTALL_OUTCOME" != success ]; then
+            failure_phase=dependency-install
+          elif [ "$CHECK_OUTCOME" != success ]; then
+            failure_phase=check
+          elif [ "$TESTS_OUTCOME" != success ]; then
+            failure_phase=vitest
+          elif [ "$CLEAN_OUTCOME" != success ]; then
+            failure_phase=dirty-tested-tree
+          elif [ "$PUBLISH_OUTCOME" != success ]; then
+            failure_phase=publish-race
+          fi
+          echo "failure_phase=$failure_phase" >> "$GITHUB_OUTPUT"
+
+  report:
+    name: Maintain integration alert
+    needs: sync
+    if: ${{ always() && needs.sync.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create, update, or resolve the managed alert
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          FAILURE_PHASE: ${{ needs.sync.outputs.failure_phase }}
+          INTEGRATION_SHA: ${{ needs.sync.outputs.integration_sha }}
+          PATCH_BASE_SHA: ${{ needs.sync.outputs.patch_base_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        with:
+          script: |
+            const marker = "<!-- daemon-durability-sync-alert -->";
+            const title = "daemon-durability integration is blocked";
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              per_page: 100,
+            });
+            const existing = openIssues.find(
+              (issue) => !issue.pull_request && issue.body?.includes(marker),
+            );
+            const succeeded = process.env.SYNC_RESULT === "success";
+            const timestamp = new Date().toISOString();
+
+            if (succeeded) {
+              if (!existing) {
+                core.info("No open daemon-durability alert to resolve.");
+                return;
+              }
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                state: "closed",
+                state_reason: "completed",
+                body: [
+                  marker,
+                  "The scheduled integration recovered.",
+                  "",
+                  `- Last successful run: ${process.env.RUN_URL}`,
+                  `- Resolved: ${timestamp}`,
+                ].join("\n"),
+              });
+              return;
+            }
+
+            const value = (name) => process.env[name] || "unavailable";
+            const body = [
+              marker,
+              "The automated upstream replay did not publish `daemon-durability`.",
+              "The integration branch remains at its last tested revision.",
+              "",
+              `- Failed phase: \`${value("FAILURE_PHASE")}\``,
+              `- Workflow run: ${process.env.RUN_URL}`,
+              `- Fetched upstream: \`${value("UPSTREAM_SHA")}\``,
+              `- Patch base: \`${value("PATCH_BASE_SHA")}\``,
+              `- Previous integration: \`${value("INTEGRATION_SHA")}\``,
+              `- Updated: ${timestamp}`,
+            ].join("\n");
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                title,
+                body,
+              });
+              return;
+            }
+
+            const repositoryLabels = await github.paginate(
+              github.rest.issues.listLabelsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              },
+            );
+            const labels = repositoryLabels.some((label) => label.name === "pkg:coding-agent")
+              ? ["pkg:coding-agent"]
+              : [];
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels,
+            });
