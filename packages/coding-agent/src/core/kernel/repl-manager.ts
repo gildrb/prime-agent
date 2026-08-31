@@ -332,6 +332,32 @@ export class ReplKernelManager {
 			this.kernelStderr += buf.toString();
 		});
 
+		// A kernel that exited (or closed its stdin) turns the next request write
+		// into EPIPE. The write callback already rejects that request, but without
+		// a listener the stream's "error" event is an uncaught exception that takes
+		// the whole host process -- and every session it runs -- down with it.
+		child.stdin?.on?.("error", (err: Error) => {
+			if (this.child !== child) return;
+			this.appendKernelDiagnostic(`stdin error: ${err.message}`);
+			// The kernel can no longer take requests; if it is somehow still alive,
+			// end it so the exit path runs the ordinary teardown.
+			if (child.exitCode === null && child.signalCode === null) {
+				try {
+					child.kill("SIGTERM");
+				} catch {
+					// Already gone.
+				}
+			}
+		});
+		for (const [name, stream] of [
+			["stdout", child.stdout],
+			["stderr", child.stderr],
+		] as const) {
+			stream?.on?.("error", (err: Error) => {
+				if (this.child === child) this.appendKernelDiagnostic(`${name} error: ${err.message}`);
+			});
+		}
+
 		child.on("error", (err) => {
 			if (this.child !== child) return;
 			this.appendKernelDiagnostic(`spawn error: ${err.message}`);
