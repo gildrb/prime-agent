@@ -114,7 +114,7 @@ import {
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
-import { DaemonWorkerClient } from "./daemon-worker-client.js";
+import { DaemonWorkerClient, DaemonWorkerRequestTimeoutError } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -152,32 +152,14 @@ const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // an abandoned prepare leaves the daemon permanently fenced with workers stopped.
 const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
-// A worker is only really gone when its process is gone. Every IPC timeout that
-// writes one off is circumstantial: a host that suspended, a VM that paused, or
-// a machine loaded enough to blow a 5s timeout freezes a perfectly healthy
-// worker for longer than the whole retry ladder, and the ladder then marks it
-// failed on the strength of that. Failed is otherwise terminal -- nothing
-// re-checks it -- so every session the worker holds stays unreachable until the
-// supervisor restarts. Keep probing while the process is alive and its start id
-// still matches, backing off but never giving up on a process that exists.
-// Bounded, because each probe that fails costs the full retry ladder again, and
-// a worker that is alive but permanently deaf must not be retried forever. The
-// budget is spent in attempts rather than wall-clock on purpose: a suspended
-// host freezes these timers too, so a sleep of any length consumes nothing and
-// the first attempt after the wake is the one that finds the worker answering.
-const FAILED_WORKER_REPROBE_DELAYS_MS = [5_000, 10_000, 30_000, 60_000, 60_000, 60_000, 60_000, 60_000] as const;
-// A worker that is alive but no longer answering IPC costs ~30s to adopt and
-// then walk the recovery ladder. start() holds the exclusive socket-path lock
-// for its whole duration and no client completes the daemon_hello handshake
-// until it resolves, so an unbounded adoption phase makes every concurrent CLI
-// give up connecting, spawn a rival supervisor, and fail on the socket lock --
-// which respawns more rivals. Adopt within a budget instead and let whatever is
-// still recovering finish in the background, exactly as a runtime disconnect does.
-const WORKER_ADOPTION_STARTUP_BUDGET_MS = 10_000;
+// An IPC timeout is circumstantial: sleep, VM suspension, or load can freeze a
+// healthy worker longer than the retry ladder. Keep probing while its process
+// may still be the recorded worker. Cap the cadence, not the attempt count, so a
+// long pause cannot make otherwise-live sessions permanently unreachable.
+const FAILED_WORKER_REPROBE_DELAYS_MS = [5_000, 10_000, 30_000, 60_000, 120_000, 300_000] as const;
 /**
- * A worker mid-turn with many child agents can take a while to answer `list`;
- * recovery runs in the background, so give it more room than a live refresh
- * before writing the worker off.
+ * Recovery needs the authoritative roster, including passive descendants. Its
+ * scan can be slower than a live refresh; timing out never proves worker death.
  */
 const WORKER_RECOVERY_LIST_TIMEOUT_MS = 15_000;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
@@ -773,20 +755,18 @@ export class DaemonSupervisor {
 			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			let adoptionFailure: unknown;
 			let adoptionFailed = false;
-			const adopting = new Set(workersToAdopt);
-			const adoptions = workersToAdopt.map(async (worker) => {
-				try {
-					await this.adoptOrRecoverWorker(worker);
-				} catch (error) {
-					if (!adoptionFailed) {
-						adoptionFailed = true;
-						adoptionFailure = error;
+			await Promise.all(
+				workersToAdopt.map(async (worker) => {
+					try {
+						await this.adoptOrRecoverWorker(worker);
+					} catch (error) {
+						if (!adoptionFailed) {
+							adoptionFailed = true;
+							adoptionFailure = error;
+						}
 					}
-				} finally {
-					adopting.delete(worker);
-				}
-			});
-			await this.awaitStartupAdoption(adoptions, adopting);
+				}),
+			);
 			if (adoptionFailed) {
 				throw adoptionFailure;
 			}
@@ -2549,7 +2529,10 @@ export class DaemonSupervisor {
 				return false;
 			}
 			worker.intentionalStop = true;
-			await this.recoverUncertainWorkerOperations(worker, false);
+			if (!(await this.recoverUncertainWorkerOperations(worker))) {
+				worker.intentionalStop = false;
+				return false;
+			}
 			this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
 			this.workers.delete(worker.descriptor.workerId);
 			this.deleteWorkerDescriptor(worker);
@@ -2923,34 +2906,6 @@ export class DaemonSupervisor {
 		}
 	}
 
-	/**
-	 * Wait for startup adoption, but never past WORKER_ADOPTION_STARTUP_BUDGET_MS.
-	 * Healthy workers adopt well inside the budget; an unresponsive one keeps
-	 * recovering in the background rather than holding the socket-path lock and
-	 * every client's daemon_hello hostage for the full connect/list retry ladder.
-	 */
-	private async awaitStartupAdoption(adoptions: Promise<void>[], adopting: Set<ResidentWorker>): Promise<void> {
-		if (adoptions.length === 0) {
-			return;
-		}
-		let budgetTimer: ReturnType<typeof setTimeout> | undefined;
-		const budgetExpired = new Promise<"budget">((resolveBudget) => {
-			budgetTimer = setTimeout(() => resolveBudget("budget"), WORKER_ADOPTION_STARTUP_BUDGET_MS);
-		});
-		try {
-			const outcome = await Promise.race([Promise.all(adoptions).then(() => "adopted" as const), budgetExpired]);
-			if (outcome === "budget") {
-				const pending = [...adopting].map((worker) => worker.descriptor.workerId);
-				this.log(
-					`Continuing daemon supervisor startup with ${pending.length} worker(s) still recovering ` +
-						`after ${WORKER_ADOPTION_STARTUP_BUDGET_MS}ms: ${pending.join(", ")}`,
-				);
-			}
-		} finally {
-			clearTimeout(budgetTimer);
-		}
-	}
-
 	private async adoptOrRecoverWorker(worker: ResidentWorker): Promise<void> {
 		await this.assertRecoveryAllowed();
 		if (worker.descriptor.stopRequestedAt) {
@@ -2991,11 +2946,12 @@ export class DaemonSupervisor {
 			}
 			const observedProcessStartId = getProcessStartId(worker.descriptor.pid);
 			await this.connectWorker(worker, 2000);
-			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
-			await this.refreshWorkerSummaries(worker, true);
 			if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
 				worker.descriptor.processStartId = observedProcessStartId;
+				this.persistWorker(worker);
 			}
+			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
+			await this.refreshWorkerSummaries(worker, true);
 			await this.assertRecoveryAllowed();
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
@@ -3006,6 +2962,18 @@ export class DaemonSupervisor {
 				return;
 			}
 			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
+			worker.client?.close();
+			worker.client = undefined;
+			if (error instanceof DaemonWorkerRequestTimeoutError && error.command === "list") {
+				try {
+					await this.assertRecoveryAllowed();
+				} catch {
+					return;
+				}
+				if (this.preserveUnresponsiveWorkerIfLive(worker)) {
+					return;
+				}
+			}
 			await this.recoverWorker(worker);
 		}
 	}
@@ -3313,29 +3281,39 @@ export class DaemonSupervisor {
 	}
 
 	/**
-	 * Keep retrying a failed worker for as long as its process is alive and still
-	 * carries the start id we recorded. A worker that only looked dead -- because
-	 * the host slept through the retry ladder, or stalled past a timeout -- is
-	 * adopted again the moment it answers, and its sessions become reachable
-	 * without a supervisor restart. A worker whose process is genuinely gone, or
-	 * whose pid was recycled into someone else's process, keeps its terminal
-	 * failed state and stops being probed.
+	 * Keep retrying while a worker may still be the recorded process. A worker
+	 * that only looked dead after sleep or load becomes reachable when it answers.
+	 * A gone or replaced process is handed back through guarded recovery; if that
+	 * fresh cleanup check becomes uncertain, this same loop continues probing.
 	 */
 	private scheduleFailedWorkerReprobe(worker: ResidentWorker): void {
 		if (worker.failedReprobe) {
 			return;
 		}
 		worker.failedReprobe = (async () => {
-			for (const reprobeDelay of FAILED_WORKER_REPROBE_DELAYS_MS) {
+			let reprobeAttempt = 0;
+			while (true) {
+				const reprobeDelay =
+					FAILED_WORKER_REPROBE_DELAYS_MS[Math.min(reprobeAttempt, FAILED_WORKER_REPROBE_DELAYS_MS.length - 1)];
+				reprobeAttempt++;
 				await unrefDelay(reprobeDelay);
 				if (this.shuttingDown || !this.isWorkerRecoveryCandidate(worker)) {
 					return;
 				}
-				// Something else already picked it up, or it is on its way out.
-				if (worker.descriptor.lifecycle !== "failed" || worker.recovery) {
-					return;
+				if (
+					(worker.descriptor.lifecycle !== "failed" && worker.descriptor.lifecycle !== "recovering") ||
+					worker.recovery
+				) {
+					continue;
 				}
-				if (!this.isWorkerProcessIdentityIntact(worker)) {
+				const processIdentity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+				if (processIdentity === "gone" || processIdentity === "replaced") {
+					worker.descriptor.lifecycle = "recovering";
+					this.persistWorker(worker);
+					await this.recoverWorker(worker).catch(() => undefined);
+					if (!worker.client && worker.descriptor.lifecycle === "recovering") {
+						continue;
+					}
 					return;
 				}
 				try {
@@ -3349,22 +3327,26 @@ export class DaemonSupervisor {
 				worker.descriptor.lifecycle = "recovering";
 				this.persistWorker(worker);
 				await this.recoverWorker(worker).catch(() => undefined);
-				// A reconnected client is the signal that adoption took: recoverWorker
-				// sets it alongside the ready lifecycle on its success path.
 				if (worker.client) {
 					this.log(`Recovered worker ${worker.descriptor.workerId} after its process started answering again`);
 					return;
 				}
 			}
-			if (this.isWorkerRecoveryCandidate(worker) && this.isWorkerProcessIdentityIntact(worker)) {
-				this.log(
-					`Stopped re-probing worker ${worker.descriptor.workerId} after ` +
-						`${FAILED_WORKER_REPROBE_DELAYS_MS.length} attempts; its process is alive but not answering`,
-				);
-			}
 		})().finally(() => {
 			worker.failedReprobe = undefined;
 		});
+	}
+
+	private preserveUnresponsiveWorkerIfLive(worker: ResidentWorker): boolean {
+		const processIdentity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+		if (processIdentity !== "current" && processIdentity !== "unknown") {
+			return false;
+		}
+		worker.descriptor.lifecycle = "recovering";
+		worker.descriptor.lastError = "Session worker may still be alive but is not answering";
+		this.persistWorker(worker);
+		this.scheduleFailedWorkerReprobe(worker);
+		return true;
 	}
 
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
@@ -3396,13 +3378,14 @@ export class DaemonSupervisor {
 					if (processAlive && processIdentityMatches) {
 						try {
 							await this.connectWorker(worker, 1500);
+							if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
+								worker.descriptor.processStartId = observedProcessStartId;
+								this.persistWorker(worker);
+							}
 							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
 							await this.refreshWorkerSummaries(worker, true);
 							if (this.isWorkerRecoveryCancelled(worker)) {
 								return;
-							}
-							if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
-								worker.descriptor.processStartId = observedProcessStartId;
 							}
 							await this.assertRecoveryAllowed();
 							worker.descriptor.lifecycle = "ready";
@@ -3417,7 +3400,14 @@ export class DaemonSupervisor {
 							await this.assertRecoveryAllowed();
 							worker.client?.close();
 							worker.client = undefined;
-							if (retryIndex < WORKER_RETRY_DELAYS_MS.length - 1) {
+							const authoritativeRosterTimedOut =
+								error instanceof DaemonWorkerRequestTimeoutError && error.command === "list";
+							// A timed-out list scan can still be running in the worker. Do not
+							// multiply that expensive scan with the immediate retry ladder.
+							if (authoritativeRosterTimedOut && this.preserveUnresponsiveWorkerIfLive(worker)) {
+								return;
+							}
+							if (!authoritativeRosterTimedOut && retryIndex < WORKER_RETRY_DELAYS_MS.length - 1) {
 								throw error;
 							}
 						}
@@ -3430,27 +3420,30 @@ export class DaemonSupervisor {
 							`Cannot safely replace live session worker ${worker.descriptor.workerId} without a verified process identity`,
 						);
 					}
+					if (this.preserveUnresponsiveWorkerIfLive(worker)) {
+						return;
+					}
 					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
 					if (!recoveryCommand || !worker.launchEnv) {
-						// A live worker that merely stopped answering keeps everything it
-						// owns: its kernels and shells are not orphans, and it is still
-						// writing its transcripts. The re-probe below adopts it again once it
-						// answers; only a dead (or replaced) process gets cleaned up here.
-						const liveWorkerProcess = this.isWorkerProcessIdentityIntact(worker);
-						if (!liveWorkerProcess) {
-							await this.recoverUncertainWorkerOperations(worker, false);
+						if (!(await this.recoverUncertainWorkerOperations(worker))) {
+							worker.descriptor.lifecycle = "recovering";
+							worker.descriptor.lastError = "Session worker identity became uncertain during recovery";
+							this.persistWorker(worker);
+							this.scheduleFailedWorkerReprobe(worker);
+							return;
 						}
 						worker.descriptor.lifecycle = "failed";
-						worker.descriptor.lastError = liveWorkerProcess
-							? "Session worker is alive but not answering"
-							: "Waiting for a client with fresh runtime context";
+						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
+						this.persistWorker(worker);
+						return;
+					}
+					if (!(await this.recoverUncertainWorkerOperations(worker))) {
+						worker.descriptor.lifecycle = "recovering";
+						worker.descriptor.lastError = "Session worker identity became uncertain during recovery";
 						this.persistWorker(worker);
 						this.scheduleFailedWorkerReprobe(worker);
 						return;
 					}
-					const safeToKillWorkerProcess =
-						processAlive && processIdentityMatches && worker.descriptor.processStartId !== undefined;
-					await this.recoverUncertainWorkerOperations(worker, safeToKillWorkerProcess);
 					if (this.isWorkerRecoveryCancelled(worker)) {
 						return;
 					}
@@ -3478,10 +3471,21 @@ export class DaemonSupervisor {
 			} catch {
 				return;
 			}
-			worker.descriptor.lifecycle = "failed";
+			const processIdentity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+			const workerMayStillBeLive = processIdentity === "current" || processIdentity === "unknown";
+			worker.descriptor.lifecycle = workerMayStillBeLive ? "recovering" : "failed";
+			if (workerMayStillBeLive) {
+				worker.descriptor.lastError = "Session worker may still be alive but is not answering";
+			}
 			this.persistWorker(worker);
-			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
-			this.scheduleFailedWorkerReprobe(worker);
+			this.log(
+				workerMayStillBeLive
+					? `Worker ${worker.descriptor.workerId} is still alive after three recovery attempts; continuing to re-probe`
+					: `Worker ${worker.descriptor.workerId} failed after three recovery attempts`,
+			);
+			if (workerMayStillBeLive) {
+				this.scheduleFailedWorkerReprobe(worker);
+			}
 		})().finally(() => {
 			worker.recovery = undefined;
 		});
@@ -3497,21 +3501,17 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private async recoverUncertainWorkerOperations(worker: ResidentWorker, killWorkerProcess = true): Promise<void> {
+	private async recoverUncertainWorkerOperations(worker: ResidentWorker): Promise<boolean> {
 		await this.assertRecoveryAllowed();
-		if (killWorkerProcess) {
-			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
-		} else if (this.isWorkerProcessIdentityIntact(worker)) {
-			// Reaping journaled children and marking transcripts interrupted is
-			// only safe once the worker process is gone. A live worker still owns
-			// its kernels and shells; killing them from here crashes it mid-turn
-			// (its next kernel write fails with EPIPE) and races its transcript
-			// writes with the interruption marker.
+		const processIdentity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+		if (processIdentity === "current" || processIdentity === "unknown") {
+			// IPC failure never authorizes process destruction. Cleanup is safe only
+			// after a fresh identity check proves the worker gone or replaced.
 			this.log(
-				`Leaving live worker ${worker.descriptor.workerId} (pid ${worker.descriptor.pid}) untouched: ` +
-					"its processes and transcripts are reclaimed only after it exits",
+				`Leaving worker ${worker.descriptor.workerId} (pid ${worker.descriptor.pid}) untouched: ` +
+					`process identity is ${processIdentity}`,
 			);
-			return;
+			return false;
 		}
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
 		if (orphanProcessJournalPath) {
@@ -3531,7 +3531,7 @@ export class DaemonSupervisor {
 		const latest = journal.getLatest();
 		const uncertain = latest.filter((record) => record.busy);
 		if (uncertain.length === 0) {
-			return;
+			return true;
 		}
 		const interruptedSessions = new Map<
 			string,
@@ -3577,6 +3577,7 @@ export class DaemonSupervisor {
 				.map((record) => record.operation)
 				.join(", ")}`,
 		);
+		return true;
 	}
 
 	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {

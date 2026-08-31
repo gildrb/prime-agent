@@ -28,6 +28,7 @@ interface SupervisorHarness {
 	handleLine(client: DaemonSocketClient, line: string): Promise<void>;
 	clients: Set<DaemonSocketClient>;
 	promptAdmissions: Map<DaemonSocketClient, Map<string, AdmissionRecord>>;
+	write: ReturnType<typeof vi.fn>;
 }
 
 function client(id: string): DaemonSocketClient {
@@ -99,6 +100,31 @@ function createHarness(
 }
 
 describe("daemon supervisor prompt admission ownership", () => {
+	it("greets before readiness without admitting create early", async () => {
+		const ready = deferred<void>();
+		const supervisor = createHarness({ ready: ready.promise });
+		const handleCommand = vi.fn(async () => success("create-1", "create"));
+		(supervisor as unknown as { handleCommand: typeof handleCommand }).handleCommand = handleCommand;
+		const socket = new PassThrough() as unknown as Socket;
+		Object.assign(socket, { destroyed: false });
+
+		supervisor.handleConnection(socket);
+		await waitFor(() =>
+			supervisor.write.mock.calls.some(([, message]) => (message as { type?: string }).type === "daemon_hello"),
+		);
+		const owner = [...supervisor.clients][0]!;
+		const pendingCreate = supervisor.handleLine(
+			owner,
+			commandLine({ id: "create-1", type: "create" } satisfies DaemonCommand),
+		);
+		await Promise.resolve();
+
+		expect(handleCommand).not.toHaveBeenCalled();
+		ready.resolve();
+		await pendingCreate;
+		expect(handleCommand).toHaveBeenCalledOnce();
+		socket.emit("close");
+	});
 	it("registers a prompt synchronously before readiness and ownership awaits", async () => {
 		const ready = deferred<void>();
 		const ownership = deferred<void>();

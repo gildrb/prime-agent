@@ -165,9 +165,12 @@ describe("writing off a worker that stopped answering", () => {
 			const harness = await setUp(process.pid, getProcessStartId(process.pid));
 			const worker = () => harness.supervisor.workers.get(WORKER_ID);
 
-			await waitFor(() => worker()?.descriptor.lifecycle === "failed", 60_000);
-			expect(worker()?.descriptor.lifecycle).toBe("failed");
-			expect(worker()?.descriptor.lastError).toBe("Session worker is alive but not answering");
+			await waitFor(
+				() => worker()?.descriptor.lastError === "Session worker may still be alive but is not answering",
+				60_000,
+			);
+			expect(worker()?.descriptor.lifecycle).toBe("recovering");
+			expect(worker()?.descriptor.lastError).toBe("Session worker may still be alive but is not answering");
 			expect(worker()?.failedReprobe).toBeDefined();
 
 			// The worker is alive and still owns its kernel: the supervisor must not
@@ -200,4 +203,89 @@ describe("writing off a worker that stopped answering", () => {
 		},
 		60_000,
 	);
+});
+
+type ProcessIdentity = "current" | "unknown" | "gone" | "replaced";
+
+interface CleanupGuardWorker {
+	descriptor: {
+		workerId: string;
+		pid: number;
+		processStartId?: string;
+		rootActiveSessionId: string;
+		sessionFile: string;
+		recoveryJournalPath: string;
+		orphanProcessJournalPath?: string;
+	};
+}
+
+interface CleanupGuardSupervisor {
+	recoverUncertainWorkerOperations(worker: CleanupGuardWorker): Promise<boolean>;
+}
+
+function setUpCleanupGuard(identity: ProcessIdentity): {
+	supervisor: CleanupGuardSupervisor;
+	worker: CleanupGuardWorker;
+	markInterrupted: ReturnType<typeof vi.fn>;
+} {
+	const directory = mkdtempSync(join(tmpdir(), "pa-cleanup-guard-"));
+	cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+	const sessionFile = join(directory, "root.jsonl");
+	const recoveryJournalPath = join(directory, "worker.recovery.jsonl");
+	writeFileSync(sessionFile, "");
+	writeFileSync(
+		recoveryJournalPath,
+		`${JSON.stringify({
+			version: 1,
+			activeSessionId: ROOT_ACTIVE_SESSION_ID,
+			sessionId: "01a031af-0000-7000-8000-000000000001",
+			sessionFile,
+			busy: true,
+			operation: "message_start",
+			recordedAt: new Date().toISOString(),
+		})}
+`,
+	);
+	const worker: CleanupGuardWorker = {
+		descriptor: {
+			workerId: "identity-guard",
+			pid: 999_999_999,
+			processStartId: "recorded-start",
+			rootActiveSessionId: ROOT_ACTIVE_SESSION_ID,
+			sessionFile,
+			recoveryJournalPath,
+		},
+	};
+	const markInterrupted = vi.fn(async () => {});
+	const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+		assertRecoveryAllowed: vi.fn(async () => {}),
+		processIdentity: vi.fn(() => identity),
+		catalog: { markInterrupted },
+		log: vi.fn(),
+	}) as CleanupGuardSupervisor;
+	return { supervisor, worker, markInterrupted };
+}
+
+describe("uncertain worker cleanup identity guard", () => {
+	for (const identity of ["current", "unknown"] as const) {
+		it(`preserves child processes and transcripts when identity is ${identity}`, async () => {
+			const { supervisor, worker, markInterrupted } = setUpCleanupGuard(identity);
+
+			await expect(supervisor.recoverUncertainWorkerOperations(worker)).resolves.toBe(false);
+
+			expect(markInterrupted).not.toHaveBeenCalled();
+		});
+	}
+
+	for (const identity of ["gone", "replaced"] as const) {
+		it(`cleans child processes and transcripts when identity is ${identity}`, async () => {
+			const { supervisor, worker, markInterrupted } = setUpCleanupGuard(identity);
+
+			await expect(supervisor.recoverUncertainWorkerOperations(worker)).resolves.toBe(true);
+
+			expect(markInterrupted).toHaveBeenCalledWith(worker.descriptor.sessionFile, ROOT_ACTIVE_SESSION_ID, [
+				"message_start",
+			]);
+		});
+	}
 });

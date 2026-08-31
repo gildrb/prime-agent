@@ -19,6 +19,13 @@ export type DaemonWorkerFrameListener = (frame: PrivateFrame<DaemonWorkerFrameHe
 export type DaemonWorkerCloseListener = (error: Error) => void;
 type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
 
+export class DaemonWorkerRequestTimeoutError extends Error {
+	constructor(readonly command: string) {
+		super(`Timed out waiting for daemon worker response to ${command}`);
+		this.name = "DaemonWorkerRequestTimeoutError";
+	}
+}
+
 export class DaemonWorkerClient {
 	private socket?: Socket;
 	private channel?: PrivateFramedChannel<DaemonWorkerFrameHeader>;
@@ -140,7 +147,7 @@ export class DaemonWorkerClient {
 		const response = new Promise<DaemonResponse>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				this.pending.delete(id);
-				reject(new Error(`Timed out waiting for daemon worker response to ${command.type}`));
+				reject(new DaemonWorkerRequestTimeoutError(command.type));
 			}, timeoutMs);
 			this.pending.set(id, { resolve, reject, timeout });
 		});

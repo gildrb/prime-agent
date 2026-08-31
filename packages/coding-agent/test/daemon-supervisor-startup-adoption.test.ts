@@ -11,7 +11,7 @@ const WORKER_ID = "wedgedworker1";
 
 interface SupervisorInternals {
 	start(): Promise<void>;
-	workers: Map<string, { descriptor: { lifecycle: string } }>;
+	workers: Map<string, { descriptor: { lifecycle: string; lastError?: string } }>;
 	catalog: { start(): Promise<void>; list(): Promise<unknown[]> };
 	cleanupSupervisorResources(): Promise<void>;
 }
@@ -30,7 +30,7 @@ function workerLifecycle(supervisor: SupervisorInternals): string | undefined {
 
 describe("daemon supervisor startup adoption", () => {
 	it.skipIf(process.platform === "win32")(
-		"listens while an unresponsive worker is still recovering",
+		"greets clients while an unresponsive worker is still being adopted",
 		async () => {
 			const directory = mkdtempSync(join(tmpdir(), "pa-adopt-"));
 			cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
@@ -50,10 +50,7 @@ describe("daemon supervisor startup adoption", () => {
 			cleanups.push(() => new Promise<void>((resolve) => worker.close(() => resolve())));
 
 			// The descriptor points at this test process: alive with a matching
-			// start id, so the supervisor must walk that ladder instead of writing
-			// the worker off as gone. Nothing kills it -- a descriptor loaded from
-			// disk carries no launchEnv, so recovery stops at "waiting for a client
-			// with fresh runtime context".
+			// start id, so the supervisor must preserve it and keep re-probing.
 			const now = new Date().toISOString();
 			writeFileSync(
 				join(descriptorDir, `${WORKER_ID}.json`),
@@ -128,19 +125,12 @@ describe("daemon supervisor startup adoption", () => {
 			expect(greetedDuringStartup).toBe(true);
 			expect(await greeting).toMatchObject({ type: "daemon_hello", socketPath });
 
-			// Without the startup budget, start() awaited the full ladder: the
-			// supervisor held the exclusive socket-path lock and withheld
-			// daemon_hello the whole time, so every rival CLI gave up connecting,
-			// spawned another supervisor, and that one died on the lock.
+			// Commands remain gated on startup, but the recognizable greeting prevents
+			// clients from declaring this live supervisor stale and spawning rivals.
 			expect(workerLifecycle(supervisor)).toBe("recovering");
-			expect(logged.mock.calls.flat().join("\n")).toContain(`still recovering`);
-
-			// The abandoned adoption still has to finish on its own.
-			const deadline = Date.now() + 30_000;
-			while (workerLifecycle(supervisor) === "recovering" && Date.now() < deadline) {
-				await new Promise((resolve) => setTimeout(resolve, 100));
-			}
-			expect(workerLifecycle(supervisor)).toBe("failed");
+			expect(supervisor.workers.get(WORKER_ID)?.descriptor.lastError).toBe(
+				"Session worker may still be alive but is not answering",
+			);
 		},
 		90_000,
 	);
