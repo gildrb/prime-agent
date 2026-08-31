@@ -128,6 +128,7 @@ import {
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
 import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
+import { installDaemonCrashHandlers } from "./daemon-crash-handlers.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
@@ -587,16 +588,7 @@ export class AgentDaemon {
 	// A crash thrown outside a command handler would otherwise vanish with the
 	// detached stdio; capture its stack before the process goes down.
 	private installCrashHandlers(): void {
-		process.on("uncaughtException", (error) => {
-			this.log(`uncaught exception: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
-			process.exit(1);
-		});
-		process.on("unhandledRejection", (reason) => {
-			this.log(
-				`unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
-			);
-			process.exit(1);
-		});
+		installDaemonCrashHandlers((message) => this.log(message));
 	}
 
 	async start(): Promise<void> {

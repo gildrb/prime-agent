@@ -1,0 +1,1 @@
+- Fixed detached daemon supervisor crashes disappearing without a cause. Uncaught exceptions and rejections, including socket-lock `ECOMPROMISED` errors, are now written to the rotating daemon log with their error code before the supervisor exits nonzero.

@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
-import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
 import {
 	acquireSessionLease,
 	SESSION_LEASE_OWNER_ID_ENV,
@@ -16,7 +16,14 @@ import { readSessionInfo, SessionManager } from "../src/core/session-manager.js"
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_ROLE_ENV,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+	DAEMON_WORKER_TOKEN_ENV,
+	type DaemonWorkerDescriptor,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
@@ -83,18 +90,27 @@ function spawnSupervisor(
 	extraEnv: NodeJS.ProcessEnv = {},
 ): ChildProcess {
 	daemonSockets.add(socketPath);
+	const environment = {
+		...process.env,
+		...extraEnv,
+		[ENV_AGENT_DIR]: agentDir,
+		PI_OFFLINE: "1",
+		TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+	};
+	delete environment[DAEMON_WORKER_ROLE_ENV];
+	delete environment[DAEMON_WORKER_TOKEN_ENV];
+	delete environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
+	delete environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+	delete environment[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+	delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
+	delete environment[SESSION_LEASES_ENABLED_ENV];
+	delete environment[SESSION_LEASE_OWNER_ID_ENV];
 	const child = spawn(
 		process.execPath,
 		[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline", ...extraArgs],
 		{
 			cwd,
-			env: {
-				...process.env,
-				...extraEnv,
-				[ENV_AGENT_DIR]: agentDir,
-				PI_OFFLINE: "1",
-				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
-			},
+			env: environment,
 			stdio: ["ignore", "pipe", "pipe"],
 		},
 	);
@@ -198,7 +214,11 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
 	}
-	throw new Error(`Timed out waiting for supervisor: ${String(lastError)}`);
+	const diagnostics = child ? childDiagnostics.get(child) : undefined;
+	throw new Error(
+		`Timed out waiting for supervisor: ${String(lastError)}` +
+			(diagnostics ? `\nstdout:\n${diagnostics.stdout}\nstderr:\n${diagnostics.stderr}` : ""),
+	);
 }
 
 async function waitForSocketGone(socketPath: string): Promise<void> {
@@ -288,6 +308,29 @@ async function startBlockingBash(client: DaemonClient, activeSessionId: string, 
 }
 
 describe("daemon supervisor resident workers", () => {
+	it.skipIf(process.platform === "win32")(
+		"logs a compromised socket lease before the supervisor exits",
+		async () => {
+			const directory = tempDir();
+			const agentDir = join(directory, "agent");
+			mkdirSync(agentDir, { recursive: true });
+			const socketPath = join(directory, "daemon.sock");
+			const supervisor = spawnSupervisor(agentDir, socketPath, directory);
+			const client = await connectEventually(socketPath, supervisor);
+			client.close();
+			const lockPath = `${socketPath}.lock`;
+			expect(existsSync(lockPath)).toBe(true);
+
+			rmSync(lockPath, { recursive: true, force: true });
+			await waitForExit(supervisor);
+
+			expect(supervisor.exitCode).not.toBe(0);
+			const logs = readDaemonLogs(agentDir);
+			expect(logs).toContain("uncaught exception");
+			expect(logs).toContain("ECOMPROMISED");
+		},
+		15_000,
+	);
 	it("accepts the canonical socket path when launched with duplicate slashes", async () => {
 		if (process.platform === "win32") return;
 		const root = tempDir();

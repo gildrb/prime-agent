@@ -59,6 +59,7 @@ import { createActiveSessionId, type DaemonSocketClient } from "./active-session
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
+import { installDaemonCrashHandlers } from "./daemon-crash-handlers.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
@@ -628,6 +629,7 @@ function mergeSessionLists(active: readonly SessionSummary[], saved: readonly Se
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
 	const supervisor = new DaemonSupervisor(socketPath, options);
+	supervisor.installCrashHandlers();
 	try {
 		await supervisor.start();
 	} catch (error) {
@@ -5589,6 +5591,14 @@ export class DaemonSupervisor {
 			client.backpressured = true;
 		}
 		return accepted;
+	}
+
+	/**
+	 * Install last-resort fatal error logging for the detached supervisor. Without this, a crash outside a
+	 * command handler would otherwise leave no trace of why the daemon died.
+	 */
+	installCrashHandlers(): void {
+		this.signalCleanupHandlers.push(installDaemonCrashHandlers((message) => this.log(message)));
 	}
 
 	private registerSignalHandlers(): void {
