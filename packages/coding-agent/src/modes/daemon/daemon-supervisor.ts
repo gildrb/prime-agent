@@ -857,6 +857,7 @@ export class DaemonSupervisor {
 		await Promise.all(
 			[...this.workers.values()].map(async (worker) => {
 				try {
+					// Responsiveness gate only: the eviction decision reads the delta-fed roster, not this pull's data.
 					await this.refreshWorkerSummaries(worker);
 					refreshed.add(worker);
 				} catch {
@@ -2059,6 +2060,8 @@ export class DaemonSupervisor {
 					// Descriptor and summary paths cover owners whose rows are not flushed yet (startup, adoption, fresh children).
 					const owner = this.findWorkerBySessionFile(command.sessionPath);
 					if (owner) {
+						// A client-owned worker's files are invisible to other clients: a foreign delete is an unknown target.
+						this.assertWorkerAccessibleToClient(client, owner, command.sessionPath);
 						// The owning worker deletes its own passivated files and publishes the removal itself.
 						if (owner.client && !this.isWorkerStopping(owner)) {
 							return this.forwardToWorker(owner, command);
@@ -2256,6 +2259,7 @@ export class DaemonSupervisor {
 		const cwd = command.cwd ? resolve(command.cwd) : undefined;
 		// Worker rows replace their scanned files in place so the newest-first catalog order survives.
 		const merged: SessionSummary[] = [];
+		const servedRows = new Set(active);
 		const mergedActiveFiles = new Set<string>();
 		const scannedFiles = new Set<string>();
 		for (const info of scanned) {
@@ -2263,7 +2267,7 @@ export class DaemonSupervisor {
 			scannedFiles.add(file);
 			const workerRow = activeByFile.get(file);
 			if (workerRow) {
-				if (active.includes(workerRow)) {
+				if (servedRows.has(workerRow)) {
 					merged.push(workerRow);
 					mergedActiveFiles.add(file);
 				}
@@ -2271,13 +2275,18 @@ export class DaemonSupervisor {
 			}
 			merged.push(summaryForInactiveSession(info));
 		}
+		const offlineRows: AgentRosterEntry[] = [];
 		for (const entry of this.roster().values()) {
 			// Ledger-only offline rows (artifact-dir children, flipped residents) ride along with the scan.
 			if (entry.queuedChild || entry.summary.activeSessionId !== undefined) continue;
 			if (entry.workerId !== undefined && this.workers.has(entry.workerId)) continue;
 			const file = entry.summary.sessionFile ? canonicalSessionPath(entry.summary.sessionFile) : undefined;
 			if (file === undefined || scannedFiles.has(file) || activeByFile.has(file)) continue;
-			const summary = sessionSummaryFromRosterEntry(await this.hydrateSeededEntry(entry));
+			offlineRows.push(entry);
+		}
+		// Hydration reads one transcript header per still-seeded row; overlap the reads.
+		for (const hydrated of await Promise.all(offlineRows.map((entry) => this.hydrateSeededEntry(entry)))) {
+			const summary = sessionSummaryFromRosterEntry(hydrated);
 			if (cwd !== undefined && resolve(summary.cwd) !== cwd) continue;
 			if (!this.matchesListSessionDir(summary, sessionDir)) continue;
 			merged.push(summary);
@@ -2294,8 +2303,11 @@ export class DaemonSupervisor {
 	private async hydrateSeededEntry(entry: AgentRosterEntry): Promise<AgentRosterEntry> {
 		if (entry.seededCwd !== true || !entry.summary.sessionFile) return entry;
 		const info = await readSessionInfo(entry.summary.sessionFile).catch(() => undefined);
-		const { seededCwd, ...rest } = entry;
 		if (!info) return entry;
+		// A frame can rewrite this agentId while the header read is in flight; never clobber the fresher row.
+		const current = this.roster().get(entry.agentId);
+		if (current !== entry) return current ?? entry;
+		const { seededCwd, ...rest } = entry;
 		return this.roster().write(
 			{ ...rest, summary: { ...entry.summary, cwd: info.cwd } },
 			entry.workerId,
@@ -2955,7 +2967,9 @@ export class DaemonSupervisor {
 				return;
 			}
 			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
-			if (error instanceof PreRosterWorkerError) {
+			// A client-owned worker's launch env and recovery config live only with its owner; a bare
+			// descriptor respawn would drop them, so recoverWorker parks it failed until the owner returns.
+			if (error instanceof PreRosterWorkerError && worker.descriptor.ownerClientId === undefined) {
 				try {
 					await this.restartPreRosterWorker(worker, observedProcessStartId);
 					return;
@@ -3558,9 +3572,8 @@ export class DaemonSupervisor {
 				entry.summary.sessionFile ? [canonicalSessionPath(entry.summary.sessionFile)] : [],
 			),
 		);
-		const scanned = await this.catalog
-			.list(undefined, this.defaultSessionConfig.sessionDir)
-			.catch(() => [] as SessionInfo[]);
+		// Fail closed: name-uniqueness checks must not pass because the scan silently shrank.
+		const scanned = await this.catalog.list(undefined, this.defaultSessionConfig.sessionDir);
 		for (const info of scanned) {
 			if (knownFiles.has(canonicalSessionPath(info.path))) continue;
 			if ((info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) !== 0) continue;
@@ -3755,8 +3768,11 @@ export class DaemonSupervisor {
 		if (!this.isWorkerRosterApplyCurrent(worker)) return;
 		// A live worker's snapshot carries its passivated rows too; absence means removal, disk backs the rest.
 		const sent = new Set(delta.entries.map((entry) => entry.agentId));
+		const unclaimed = new Set<string>();
 		for (const entry of this.workerRosterEntries(worker)) {
-			if (!sent.has(entry.agentId)) this.roster().delete(entry.agentId);
+			if (sent.has(entry.agentId)) continue;
+			unclaimed.add(entry.agentId);
+			this.roster().delete(entry.agentId);
 		}
 		for (const entry of delta.entries) {
 			this.writeRosterEntry(entry, worker);
@@ -3766,11 +3782,16 @@ export class DaemonSupervisor {
 			this.roster().delete(agentId);
 		}
 		// Deleted absentees with surviving transcripts reseed from the pre-read edges, tombstone-filtered.
+		// A reseed keeps its previous claim: passive registry children list and attach through their live
+		// owner, and snapshots (which never compose them) must not flap that claim off.
 		for (const edge of edges) {
 			const entry = this.rosterEntryForSpawnLedgerEdge(edge);
 			if (this.roster().has(entry.agentId)) continue;
 			if (this.roster().hasSessionFile(canonicalSessionPath(edge.child))) continue;
-			this.roster().write({ ...entry, seededCwd: true });
+			this.roster().write(
+				{ ...entry, seededCwd: true },
+				unclaimed.has(entry.agentId) ? worker.descriptor.workerId : undefined,
+			);
 		}
 	}
 
@@ -3794,12 +3815,14 @@ export class DaemonSupervisor {
 		this.persistWorker(worker);
 	}
 
-	/** Pulled rows fill gaps and claim workerless seeded rows; delta-fed rows are never overwritten. */
+	/** Pulled rows fill gaps, claim workerless rows, and flesh out synthetic seeds; delta-fed rows are never overwritten. */
 	private fillRosterGapsFromWorkerSummaries(worker: ResidentWorker): void {
 		for (const summary of worker.summaries.values()) {
 			const entry = workerRosterEntryFromSummary(summary);
 			const existing = this.roster().get(entry.agentId);
-			if (existing === undefined || existing.workerId === undefined) this.writeRosterEntry(entry, worker);
+			if (existing === undefined || existing.workerId === undefined || existing.seededCwd === true) {
+				this.writeRosterEntry(entry, worker);
+			}
 		}
 	}
 
@@ -3814,6 +3837,11 @@ export class DaemonSupervisor {
 	/** A stopped or evicted worker leaves inactive rows behind, never gaps. */
 	private flipWorkerRosterEntriesInactive(worker: ResidentWorker): void {
 		for (const entry of this.workerRosterEntries(worker)) {
+			// A terminal unbound child run owns no transcript: it is a removal, never a passivated row.
+			if (entry.queuedChild) {
+				this.roster().delete(entry.agentId);
+				continue;
+			}
 			this.writeRosterEntry(passivatedWorkerRosterEntry(entry));
 		}
 	}
@@ -4071,6 +4099,8 @@ export class DaemonSupervisor {
 		const exact: WorkerMatch[] = [];
 		const suffix: WorkerMatch[] = [];
 		for (const entry of this.roster().values()) {
+			// A queued child has no session to route a command to; its name must not shadow or collide.
+			if (entry.queuedChild) continue;
 			const worker = entry.workerId !== undefined ? this.workers.get(entry.workerId) : undefined;
 			if (!worker || (includeWorker && !includeWorker(worker))) {
 				continue;
@@ -4092,7 +4122,10 @@ export class DaemonSupervisor {
 
 	private findSummaryInWorker(worker: ResidentWorker, selector: string): SessionSummary | undefined {
 		const pathSelector = looksLikeSessionPath(selector) ? canonicalSessionPath(selector) : undefined;
-		const summaries = this.workerRosterEntries(worker).map(sessionSummaryFromRosterEntry);
+		// A queued child has no session to route a command to; its name must not shadow or collide.
+		const summaries = this.workerRosterEntries(worker)
+			.filter((entry) => !entry.queuedChild)
+			.map(sessionSummaryFromRosterEntry);
 		const exact = summaries.find((summary) => {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
 			return (
