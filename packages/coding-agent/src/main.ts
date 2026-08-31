@@ -74,7 +74,11 @@ import { isTelemetryEnabled } from "./core/telemetry.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
 import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
-import { DaemonSessionCreateError, deserializeDaemonCreateError } from "./modes/daemon/daemon-errors.js";
+import {
+	DaemonSessionCreateError,
+	deserializeDaemonCreateError,
+	deserializeDaemonError,
+} from "./modes/daemon/daemon-errors.js";
 import { collectDaemonClientEnv, collectDaemonLaunchEnv } from "./modes/daemon/daemon-protocol.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -967,6 +971,9 @@ async function createDaemonClientConnection(options: {
 				sendClientEnv: true,
 				ownedSession: options.clientOwned,
 				ownedSessionRecoveryConfig: options.clientOwned ? options.config : undefined,
+				recreateSession: options.clientOwned
+					? undefined
+					: (sessionFile) => resumeDaemonSessionInFreshWorker(client, options.config, sessionFile),
 				supportsExtensionUi: options.supportsExtensionUi,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 				telemetryDisabled: options.config.telemetryDisabled,
@@ -1017,6 +1024,34 @@ async function createDaemonClientConnection(options: {
 		client.close();
 		throw error;
 	}
+}
+
+/**
+ * Relaunch a resident session from its transcript after its worker died: the
+ * supervisor only keeps the durable create command, so the client supplies the
+ * runtime config and env again, just like a fresh `--resume` would.
+ */
+async function resumeDaemonSessionInFreshWorker(
+	client: DaemonClient,
+	config: AgentSessionRuntimeConfig,
+	sessionPath: string,
+): Promise<string> {
+	const response = await client.request({
+		type: "create",
+		config,
+		sessionPath,
+		continueRecent: false,
+		env: collectDaemonClientEnv(),
+		lifecycle: "resident",
+		launchEnv: collectDaemonLaunchEnv(),
+	});
+	if (!response.success) {
+		throw deserializeDaemonError(response);
+	}
+	if (!isDaemonSessionSummary(response.data)) {
+		throw new Error("Daemon returned an invalid create response");
+	}
+	return getDaemonSummaryActiveSessionId(response.data);
 }
 
 async function findAttachedDaemonSessionSummary(

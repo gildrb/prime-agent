@@ -177,6 +177,13 @@ export interface DaemonAgentConnectionOptions {
 	ownedSession?: boolean;
 	/** Fresh runtime context used only if the owned worker must be relaunched. */
 	ownedSessionRecoveryConfig?: AgentSessionRuntimeConfig;
+	/**
+	 * Resume the session transcript in a fresh worker when a reconnect finds the
+	 * previous worker failed (it died while the supervisor was away, and only a
+	 * client carries the runtime context to relaunch it). Resolves with the new
+	 * active session id. Not used for owned sessions, which recover in place.
+	 */
+	recreateSession?: (sessionFile: string) => Promise<string>;
 	/** Require the target worker to have been created with telemetry disabled. */
 	telemetryDisabled?: true;
 }
@@ -187,6 +194,10 @@ export interface DaemonAgentConnectionOptions {
  * InteractiveMode depends only on AgentConnection; local socket ownership and
  * daemon command details stay inside this adapter.
  */
+function isFailedWorkerAttachError(error: unknown): boolean {
+	return error instanceof Error && error.message.startsWith("Session worker is failed");
+}
+
 export function buildSessionTreeFromFlatNodes(
 	flatNodes: readonly AgentConnectionSessionTreeFlatNode[],
 ): AgentConnectionSessionTreeNode[] {
@@ -1485,6 +1496,41 @@ export class DaemonAgentConnection implements AgentConnection {
 		return run;
 	}
 
+	/**
+	 * Reattach after a transport loss. "Session worker is failed" means the
+	 * worker process is gone and the supervisor is waiting for a client with
+	 * fresh runtime context: resume the transcript in a new worker, exactly as
+	 * `--resume` would, instead of burning the reconnect budget on attaches
+	 * that can never succeed. A worker reported as recovering is left to the
+	 * retry loop; it may still come back with its in-flight work intact.
+	 */
+	private async attachForReconnect(): Promise<void> {
+		try {
+			await this.attach();
+			return;
+		} catch (error) {
+			const recreateSession = this.options.recreateSession;
+			const sessionFile = this.attachedSessionFile;
+			if (!recreateSession || !sessionFile || this.options.ownedSession || !isFailedWorkerAttachError(error)) {
+				throw error;
+			}
+			this.adoptReplacementActiveSession(await recreateSession(sessionFile));
+		}
+		await this.attach();
+	}
+
+	/** Point this connection at a freshly created worker; its event stream starts over. */
+	private adoptReplacementActiveSession(activeSessionId: string): void {
+		this.activeSessionId = activeSessionId;
+		this.lastEventCursor = undefined;
+		this.lastEventSequence = undefined;
+		this.childRosterSequence = undefined;
+		this.latestSnapshot = undefined;
+		this.latestSnapshotIsFresh = false;
+		this.retiredEventGenerations.clear();
+		this.activeSideQuestionIds.clear();
+	}
+
 	private async reconnect(cause: Error): Promise<void> {
 		if (this.reconnectPromise) {
 			return this.reconnectPromise;
@@ -1502,7 +1548,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					}
 					await this.client.connect(1000);
 					await this.client.waitForHello(3000);
-					await this.attach();
+					await this.attachForReconnect();
 					if (!this.disposed) {
 						const snapshot = await this.getInitialSnapshot();
 						void this.emit({ type: "session_resynced", snapshot });

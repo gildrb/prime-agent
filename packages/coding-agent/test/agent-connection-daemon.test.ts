@@ -45,6 +45,7 @@ class FakeDaemonClient {
 	resetTransportCount = 0;
 	reconnectError: Error | undefined;
 	attachFailures = 0;
+	attachErrorFactory: ((command: Extract<DaemonCommand, { type: "attach" }>) => string | undefined) | undefined;
 	connectionStateGate: Promise<void> | undefined;
 	connectionStateFactory: ((activeSessionId: string) => AgentConnectionState) | undefined;
 	rlmChildren: AgentConnectionRlmChildAgentSnapshot[] = [];
@@ -104,7 +105,7 @@ class FakeDaemonClient {
 					success: true,
 					data: { sessions: this.updateRestartSessions },
 				};
-			case "attach":
+			case "attach": {
 				if (this.attachFailures > 0) {
 					this.attachFailures--;
 					throw new Error("attach failed");
@@ -121,6 +122,10 @@ class FakeDaemonClient {
 						error: "Unknown active session: missing",
 					};
 				}
+				const attachError = this.attachErrorFactory?.(command);
+				if (attachError !== undefined) {
+					return { type: "response", command: command.type, success: false, error: attachError };
+				}
 				return {
 					type: "response",
 					command: command.type,
@@ -129,6 +134,7 @@ class FakeDaemonClient {
 						this.attachResultFactory?.(command) ??
 						createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12),
 				};
+			}
 			case "get_queue":
 				return {
 					type: "response",
@@ -1137,6 +1143,76 @@ describe("DaemonAgentConnection", () => {
 				}),
 				{ type: "connection_status", status: "connected" },
 			]);
+		});
+	});
+
+	it("resumes the transcript in a fresh worker when a reconnect finds the worker failed", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const recreateSession = vi.fn(async (_sessionFile: string) => "active-fresh");
+		let attaches = 0;
+		fakeClient.attachErrorFactory = (command) => {
+			attaches++;
+			// The first attach succeeds; after the socket loss the supervisor reports
+			// the original worker as gone.
+			return attaches > 1 && command.activeSessionId === "active-original"
+				? "Session worker is failed: Waiting for a client with fresh runtime context"
+				: undefined;
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original", {
+			recoverDaemon: async () => {},
+			recreateSession,
+		});
+		const events: AgentConnectionEvent[] = [];
+		const resynced = new Promise<AgentConnectionEvent>((resolve) => {
+			connection.subscribe((event) => {
+				events.push(event);
+				if (event.type === "session_resynced") {
+					resolve(event);
+				}
+			});
+		});
+		await connection.attach();
+
+		fakeClient.connected = false;
+		fakeClient.emitClose(new Error("Daemon socket closed"));
+
+		await expect(resynced).resolves.toMatchObject({
+			type: "session_resynced",
+			snapshot: { state: { activeSessionId: "active-fresh" } },
+		});
+		expect(recreateSession).toHaveBeenCalledWith("/tmp/session-current.jsonl");
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach", "attach", "attach"]);
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "attach",
+			activeSessionId: "active-fresh",
+			resumeCursor: undefined,
+		});
+		await vi.waitFor(() => {
+			expect(events.at(-1)).toEqual({ type: "connection_status", status: "connected" });
+		});
+	});
+
+	it("gives up on a failed worker without a way to recreate the session", async () => {
+		const fakeClient = new FakeDaemonClient();
+		let attaches = 0;
+		fakeClient.attachErrorFactory = () => (++attaches > 1 ? "Session worker is failed" : undefined);
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original", {
+			recoverDaemon: async () => {},
+			reconnectTimeoutMs: 200,
+		});
+		const closed = new Promise<AgentConnectionEvent>((resolve) => {
+			connection.subscribe((event) => {
+				if (event.type === "closed") resolve(event);
+			});
+		});
+		await connection.attach();
+
+		fakeClient.connected = false;
+		fakeClient.emitClose(new Error("Daemon socket closed"));
+
+		await expect(closed).resolves.toMatchObject({
+			type: "closed",
+			error: "Daemon reconnection failed: Session worker is failed",
 		});
 	});
 

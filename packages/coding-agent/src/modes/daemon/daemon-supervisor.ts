@@ -3843,6 +3843,33 @@ export class DaemonSupervisor {
 		throw new Error(`Unknown active session: ${selector}`);
 	}
 
+	/**
+	 * A client reconnecting to its root session must be able to tell a worker
+	 * that is still being recovered (worth retrying) or whose process is gone
+	 * (only a fresh create can bring the session back) from a session that
+	 * never existed. A worker that is alive but not answering is reported as
+	 * recovering: its re-probe is still pending. Sessions the client may not
+	 * see stay unknown.
+	 */
+	private describeUnreachableWorker(client: DaemonSocketClient, selector: string, error: unknown): unknown {
+		if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) {
+			return error;
+		}
+		const worker = [...this.workers.values()].find(
+			(candidate) =>
+				this.isWorkerAccessibleToClient(client, candidate) &&
+				(candidate.descriptor.rootActiveSessionId === selector || candidate.descriptor.rootSessionId === selector),
+		);
+		if (!worker || (worker.client !== undefined && worker.descriptor.lifecycle === "ready")) {
+			return error;
+		}
+		const state = this.effectiveWorkerState(worker);
+		if (state === "failed" && this.isWorkerProcessIdentityIntact(worker)) {
+			return new Error("Session worker is recovering");
+		}
+		return new Error(`Session worker is ${state}`);
+	}
+
 	private findWorkerForClient(client: DaemonSocketClient, selector: string): Promise<WorkerMatch> {
 		return this.findWorker(selector, (worker) => this.isWorkerAccessibleToClient(client, worker));
 	}
@@ -3989,7 +4016,9 @@ export class DaemonSupervisor {
 				await this.recoverWorker(ownedWorker);
 			}
 		}
-		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		const match = await this.findWorkerForClient(client, command.activeSessionId).catch((error: unknown) => {
+			throw this.describeUnreachableWorker(client, command.activeSessionId, error);
+		});
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
 		this.requireAvailableWorkerClient(match.worker);
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
