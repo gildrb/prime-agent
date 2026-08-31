@@ -174,6 +174,12 @@ const FAILED_WORKER_REPROBE_DELAYS_MS = [5_000, 10_000, 30_000, 60_000, 60_000, 
 // which respawns more rivals. Adopt within a budget instead and let whatever is
 // still recovering finish in the background, exactly as a runtime disconnect does.
 const WORKER_ADOPTION_STARTUP_BUDGET_MS = 10_000;
+/**
+ * A worker mid-turn with many child agents can take a while to answer `list`;
+ * recovery runs in the background, so give it more room than a live refresh
+ * before writing the worker off.
+ */
+const WORKER_RECOVERY_LIST_TIMEOUT_MS = 15_000;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
@@ -3426,9 +3432,18 @@ export class DaemonSupervisor {
 					}
 					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
 					if (!recoveryCommand || !worker.launchEnv) {
-						await this.recoverUncertainWorkerOperations(worker, false);
+						// A live worker that merely stopped answering keeps everything it
+						// owns: its kernels and shells are not orphans, and it is still
+						// writing its transcripts. The re-probe below adopts it again once it
+						// answers; only a dead (or replaced) process gets cleaned up here.
+						const liveWorkerProcess = this.isWorkerProcessIdentityIntact(worker);
+						if (!liveWorkerProcess) {
+							await this.recoverUncertainWorkerOperations(worker, false);
+						}
 						worker.descriptor.lifecycle = "failed";
-						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
+						worker.descriptor.lastError = liveWorkerProcess
+							? "Session worker is alive but not answering"
+							: "Waiting for a client with fresh runtime context";
 						this.persistWorker(worker);
 						this.scheduleFailedWorkerReprobe(worker);
 						return;
@@ -3486,6 +3501,17 @@ export class DaemonSupervisor {
 		await this.assertRecoveryAllowed();
 		if (killWorkerProcess) {
 			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+		} else if (this.isWorkerProcessIdentityIntact(worker)) {
+			// Reaping journaled children and marking transcripts interrupted is
+			// only safe once the worker process is gone. A live worker still owns
+			// its kernels and shells; killing them from here crashes it mid-turn
+			// (its next kernel write fails with EPIPE) and races its transcript
+			// writes with the interruption marker.
+			this.log(
+				`Leaving live worker ${worker.descriptor.workerId} (pid ${worker.descriptor.pid}) untouched: ` +
+					"its processes and transcripts are reclaimed only after it exits",
+			);
+			return;
 		}
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
 		if (orphanProcessJournalPath) {
@@ -3560,7 +3586,7 @@ export class DaemonSupervisor {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
-		const response = await worker.client.request({ type: "list" }, 5000);
+		const response = await worker.client.request({ type: "list" }, recovery ? WORKER_RECOVERY_LIST_TIMEOUT_MS : 5000);
 		const summaries = sessionSummariesFromResponse(response);
 		const nextSummaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
 		const root = nextSummaries.get(worker.descriptor.rootActiveSessionId);
@@ -5623,7 +5649,7 @@ export class DaemonSupervisor {
 	}
 
 	/**
-	 * Install last-resort fatal error logging for the detached supervisor. Without this, a crash outside a
+	 * The supervisor runs detached with ignored stdio, so a crash outside a
 	 * command handler would otherwise leave no trace of why the daemon died.
 	 */
 	installCrashHandlers(): void {
