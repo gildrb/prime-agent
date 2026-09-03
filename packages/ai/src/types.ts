@@ -12,6 +12,7 @@ export type KnownApi =
 	| "anthropic-messages"
 	| "bedrock-converse-stream"
 	| "google-generative-ai"
+	| "google-gemini-cli"
 	| "google-vertex";
 
 export type Api = KnownApi | (string & {});

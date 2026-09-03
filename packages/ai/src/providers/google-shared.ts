@@ -1,11 +1,11 @@
-/** Shared utilities for Google Generative AI and Vertex providers. */
+/** Shared utilities for Google Generative AI, Vertex, and Cloud Code Assist providers. */
 
 import { type Content, FinishReason, FunctionCallingConfigMode, type Part } from "@google/genai";
 import type { Context, ImageContent, Model, StopReason, TextContent, ThinkingBudgets, Tool } from "../types.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { transformMessages } from "./transform-messages.js";
 
-type GoogleApiType = "google-generative-ai" | "google-vertex";
+type GoogleApiType = "google-generative-ai" | "google-gemini-cli" | "google-vertex";
 
 /** Thinking level values accepted by Gemini 3 models. */
 export type GoogleThinkingLevel = "THINKING_LEVEL_UNSPECIFIED" | "MINIMAL" | "LOW" | "MEDIUM" | "HIGH";
@@ -336,5 +336,17 @@ export function mapStopReason(reason: FinishReason): StopReason {
 			const _exhaustive: never = reason;
 			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
 		}
+	}
+}
+
+/** Converts raw Google finish reason strings to the shared stop-reason protocol. */
+export function mapStopReasonString(reason: string): StopReason {
+	switch (reason) {
+		case "STOP":
+			return "stop";
+		case "MAX_TOKENS":
+			return "length";
+		default:
+			return "error";
 	}
 }

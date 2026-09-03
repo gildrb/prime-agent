@@ -10,6 +10,7 @@ export type { AnthropicEffort, AnthropicOptions, AnthropicThinkingDisplay } from
 export type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses.js";
 export * from "./providers/faux.js";
 export type { GoogleOptions } from "./providers/google.js";
+export type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli.js";
 export type { GoogleThinkingLevel } from "./providers/google-shared.js";
 export type { GoogleVertexOptions } from "./providers/google-vertex.js";
 export type { MistralOptions } from "./providers/mistral.js";

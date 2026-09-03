@@ -887,6 +887,43 @@ describe("ModelRegistry", () => {
 			expect(registry.getProviderDisplayName("oauth-provider")).toBe("OAuth Provider");
 		});
 
+		test("OAuth modifyModels can add account-discovered models without a static catalog", () => {
+			authStorage.set("dynamic-oauth", {
+				type: "oauth",
+				access: "access",
+				refresh: "refresh",
+				expires: Date.now() + 60_000,
+			});
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			registry.registerProvider("dynamic-oauth", {
+				oauth: {
+					name: "Dynamic OAuth",
+					login: async () => ({ access: "access", refresh: "refresh", expires: Date.now() + 60_000 }),
+					refreshToken: async (credentials) => credentials,
+					getApiKey: (credentials) => credentials.access,
+					modifyModels: (models) => [
+						...models,
+						{
+							id: "account-model",
+							name: "Account Model",
+							api: "openai-completions",
+							provider: "dynamic-oauth",
+							baseUrl: "https://provider.test/v1",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 4096,
+						} as Model<Api>,
+					],
+				},
+			});
+
+			expect(registry.find("dynamic-oauth", "account-model")).toBeDefined();
+			registry.refresh();
+			expect(registry.find("dynamic-oauth", "account-model")).toBeDefined();
+		});
+
 		test("failed registerProvider does not persist invalid streamSimple config", () => {
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 

@@ -1167,7 +1167,6 @@ import {
   loginAnthropic,
   loginOpenAICodex,
   loginGitHubCopilot,
-  loginGeminiCli,
 
   // Token management
   refreshOAuthToken,   // (provider, credentials) => new credentials

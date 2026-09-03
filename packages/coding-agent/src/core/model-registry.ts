@@ -1545,12 +1545,6 @@ export class ModelRegistry {
 					compat: modelDef.compat,
 				} as Model<Api>);
 			}
-			if (config.oauth?.modifyModels) {
-				const cred = this.authStorage.get(providerName);
-				if (cred?.type === "oauth") {
-					this.models = config.oauth.modifyModels(this.models, cred);
-				}
-			}
 		} else if (config.baseUrl || config.headers) {
 			this.models = this.models.map((m) => {
 				if (m.provider !== providerName) return m;
@@ -1559,6 +1553,13 @@ export class ModelRegistry {
 					baseUrl: config.baseUrl ?? m.baseUrl,
 				};
 			});
+		}
+
+		if (config.oauth?.modifyModels) {
+			const cred = this.authStorage.get(providerName);
+			if (cred?.type === "oauth") {
+				this.models = config.oauth.modifyModels(this.models, cred);
+			}
 		}
 	}
 }
