@@ -4098,7 +4098,7 @@ describe("InteractiveMode post-login model preparation", () => {
 		applySelectedModel(model: AgentConnectionModel): Promise<void>;
 		showError(message: string): void;
 		uiServices: {
-			modelRegistry: Pick<ModelRegistry, "find">;
+			modelRegistry: Pick<ModelRegistry, "find" | "getAvailable">;
 			settingsManager: {
 				flush(): Promise<void>;
 			};
@@ -4131,6 +4131,7 @@ describe("InteractiveMode post-login model preparation", () => {
 		fakeThis.uiServices = {
 			modelRegistry: {
 				find: vi.fn(() => fallbackModel),
+				getAvailable: vi.fn(() => []),
 			},
 			settingsManager: {
 				flush: flushSettings,
@@ -4161,6 +4162,7 @@ describe("InteractiveMode post-login model preparation", () => {
 		fakeThis.uiServices = {
 			modelRegistry: {
 				find: vi.fn(() => undefined),
+				getAvailable: vi.fn(() => []),
 			},
 			settingsManager: {
 				flush: vi.fn(async () => {}),

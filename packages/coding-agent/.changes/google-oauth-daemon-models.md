@@ -1,0 +1,1 @@
+- Fixed OAuth login so newly discovered account models load into an already-running daemon session.

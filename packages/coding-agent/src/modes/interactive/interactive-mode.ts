@@ -8661,6 +8661,7 @@ export class InteractiveMode {
 	}
 
 	private async prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean> {
+		await this.reloadConnectionForNewOAuthModels(authResult);
 		const currentModel = this.getCurrentModel();
 		// The agent core uses unknown/unknown as its no-model sentinel.
 		const selectedModel =
@@ -8697,6 +8698,29 @@ export class InteractiveMode {
 		}
 
 		return true;
+	}
+
+	private async reloadConnectionForNewOAuthModels(authResult: AuthenticationResult): Promise<void> {
+		if (authResult.status !== "success" || authResult.authType !== "oauth") return;
+
+		const localModels = this.modelRegistry.getAvailable().filter((model) => model.provider === authResult.providerId);
+		if (localModels.length === 0) return;
+
+		const connectionModels = new Set(
+			this.connectionModelCatalog
+				.filter((model) => model.provider === authResult.providerId)
+				.map((model) => `${model.provider}/${model.id}`),
+		);
+		if (localModels.every((model) => connectionModels.has(`${model.provider}/${model.id}`))) return;
+		if (this.isAgentStreaming() || this.isAgentCompacting()) {
+			this.showWarning(
+				`${authResult.providerName} login succeeded. Run /reload after the current turn to load its models.`,
+			);
+			return;
+		}
+
+		await this.agentConnection.reload();
+		await this.refreshConnectionModelsAfterAuthChange();
 	}
 
 	private async handleMcpCommand(args: string | undefined): Promise<void> {

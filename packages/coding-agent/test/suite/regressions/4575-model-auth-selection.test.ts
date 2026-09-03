@@ -24,6 +24,23 @@ interface ConnectionAuthRefreshHarness {
 	refreshConnectionModelsAfterAuthChange(): Promise<void>;
 }
 
+interface NewOAuthModelsHarness extends ConnectionAuthRefreshHarness {
+	agentConnection: {
+		getModelCatalog(): Promise<AgentConnectionModelCatalog>;
+		reload(): Promise<void>;
+	};
+	uiServices: { modelRegistry: { getAvailable(): AgentConnectionModel[] } };
+	isAgentStreaming(): boolean;
+	isAgentCompacting(): boolean;
+	showWarning(message: string): void;
+	reloadConnectionForNewOAuthModels(authResult: {
+		status: "success";
+		providerId: string;
+		providerName: string;
+		authType: "oauth";
+	}): Promise<void>;
+}
+
 interface InteractiveAutocompleteHarness {
 	connectionState: { scopedModels: Array<{ model: AgentConnectionModel }> };
 	connectionModelCatalog: AgentConnectionModel[];
@@ -51,6 +68,42 @@ describe("ENG-4575 model authentication", () => {
 			harness.cleanup();
 		}
 	});
+
+	async function runNewOAuthModelCheck(options: { connectionHasModel?: boolean; streaming?: boolean } = {}) {
+		const harness = await createHarness({ models: [{ id: "base", name: "Base", reasoning: true }] });
+		harnesses.push(harness);
+		const oauthModel = {
+			...harness.getModel("base")!,
+			provider: "dynamic-oauth",
+			id: "account-model",
+		} as AgentConnectionModel;
+		const reload = vi.fn(async () => {});
+		const showWarning = vi.fn();
+		const getModelCatalog = vi.fn(async () => ({
+			models: [oauthModel],
+			configuredProviders: [oauthModel.provider],
+		}));
+		const fakeThis = Object.create(InteractiveMode.prototype) as NewOAuthModelsHarness;
+		fakeThis.agentConnection = { getModelCatalog, reload };
+		fakeThis.uiServices = { modelRegistry: { getAvailable: () => [oauthModel] } };
+		fakeThis.isAgentStreaming = () => options.streaming === true;
+		fakeThis.isAgentCompacting = () => false;
+		fakeThis.showWarning = showWarning;
+		fakeThis.connectionModelCatalog = options.connectionHasModel ? [oauthModel] : [];
+		fakeThis.connectionConfiguredProviders = options.connectionHasModel ? new Set([oauthModel.provider]) : new Set();
+		fakeThis.connectionModelsFetchedAt = Date.now();
+		fakeThis.connectionModelsRefreshVersion = 0;
+		fakeThis.connectionModelsRefreshInFlight = undefined;
+
+		await fakeThis.reloadConnectionForNewOAuthModels({
+			status: "success",
+			providerId: oauthModel.provider,
+			providerName: "Dynamic OAuth",
+			authType: "oauth",
+		});
+
+		return { fakeThis, getModelCatalog, oauthModel, reload, showWarning };
+	}
 
 	test("shows unauthenticated public models after authenticated providers", async () => {
 		const harness = await createHarness({
@@ -136,6 +189,30 @@ describe("ENG-4575 model authentication", () => {
 		expect(fakeThis.connectionConfiguredProviders).toEqual(new Set());
 		expect(fakeThis.getAvailableConnectionModels()).toEqual([]);
 		expect(fakeThis.connectionModelCatalog).toEqual([model]);
+	});
+
+	test("reloads a daemon that is missing models from a newly loaded OAuth extension", async () => {
+		const { fakeThis, getModelCatalog, oauthModel, reload } = await runNewOAuthModelCheck();
+
+		expect(reload).toHaveBeenCalledOnce();
+		expect(getModelCatalog).toHaveBeenCalledOnce();
+		expect(fakeThis.connectionModelCatalog).toEqual([oauthModel]);
+		expect(fakeThis.connectionConfiguredProviders).toEqual(new Set([oauthModel.provider]));
+	});
+
+	test("defers a missing OAuth model reload while the agent is streaming", async () => {
+		const { getModelCatalog, reload, showWarning } = await runNewOAuthModelCheck({ streaming: true });
+
+		expect(reload).not.toHaveBeenCalled();
+		expect(getModelCatalog).not.toHaveBeenCalled();
+		expect(showWarning).toHaveBeenCalledOnce();
+	});
+
+	test("does not reload when the daemon already has the OAuth account models", async () => {
+		const { getModelCatalog, reload } = await runNewOAuthModelCheck({ connectionHasModel: true });
+
+		expect(reload).not.toHaveBeenCalled();
+		expect(getModelCatalog).not.toHaveBeenCalled();
 	});
 
 	test("returns the full public catalog to catalog-facing selectors", async () => {
