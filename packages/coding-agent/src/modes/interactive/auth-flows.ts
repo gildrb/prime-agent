@@ -1,5 +1,10 @@
 import * as path from "node:path";
-import { getProviders, type OAuthProviderId, type OAuthSelectPrompt } from "@earendil-works/pi-ai";
+import {
+	getProviders,
+	type OAuthDeviceCodeInfo,
+	type OAuthProviderId,
+	type OAuthSelectPrompt,
+} from "@earendil-works/pi-ai";
 import type { OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { getAuthPath, getDocsPath } from "../../config.js";
 import type { ModelRegistry } from "../../core/model-registry.js";
@@ -845,6 +850,11 @@ export class ProviderAuthFlows {
 					} else if (providerId === "github-copilot") {
 						dialog.showWaiting("Waiting for browser authentication...");
 					}
+				},
+
+				onDeviceCode: (info: OAuthDeviceCodeInfo) => {
+					dialog.showDeviceCode(info);
+					dialog.showWaiting("Waiting for device authentication...");
 				},
 
 				onPrompt: async (prompt: { message: string; placeholder?: string }) => {

@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Added OpenAI Codex subscription device-code login as a selectable headless alternative to browser callbacks.
+
 ## [0.9.0] - 2026-09-01
 
 - Refreshed the model catalog from live provider catalogs (pricing updates, new and removed models); fixed OpenCode Go Qwen routes mislabeled as Anthropic and excluded private dev/ Prime Inference routes.

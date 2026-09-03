@@ -1,5 +1,5 @@
 import { win32 } from "node:path";
-import { getOAuthProviders } from "@earendil-works/pi-ai/oauth";
+import { getOAuthProviders, type OAuthDeviceCodeInfo } from "@earendil-works/pi-ai/oauth";
 import {
 	type Component,
 	Container,
@@ -171,7 +171,35 @@ export class LoginDialogComponent extends Container implements Focusable {
 			this.addInstructions(instructions);
 		}
 
-		// Try to open browser
+		this.openAuthUrl(url);
+		this.tui.requestRender();
+	}
+
+	showDeviceCode(info: OAuthDeviceCodeInfo): void {
+		this.startContent();
+		this.authUrl = info.verificationUri;
+		this.addSectionTitle("Device sign-in");
+		this.addMutedText("Open the verification link on any device, then enter the code shown below.");
+		this.contentContainer.addChild(new Spacer(1));
+		this.addLabel("Verification link");
+		const linkedUrl = getCapabilities().hyperlinks
+			? `\x1b]8;;${info.verificationUri}\x07${info.verificationUri}\x1b]8;;\x07`
+			: info.verificationUri;
+		this.contentContainer.addChild(new Text(theme.fg("text", linkedUrl), 0, 0));
+		this.authActions = new Text(this.getAuthActionsText(), 0, 0);
+		this.contentContainer.addChild(this.authActions);
+		this.contentContainer.addChild(new Spacer(1));
+		this.addLabel("Verification code");
+		this.contentContainer.addChild(new Text(theme.bold(theme.fg("text", info.userCode)), 0, 0));
+		if (info.expiresInSeconds) {
+			this.addMutedText(`Code expires in ${Math.ceil(info.expiresInSeconds / 60)} minutes.`);
+		}
+
+		this.openAuthUrl(info.verificationUri);
+		this.tui.requestRender();
+	}
+
+	private openAuthUrl(url: string): void {
 		const [command, ...args] =
 			process.platform === "darwin"
 				? ["open", url]
@@ -183,8 +211,6 @@ export class LoginDialogComponent extends Container implements Focusable {
 						]
 					: ["xdg-open", url];
 		execFile(command, args, () => {});
-
-		this.tui.requestRender();
 	}
 
 	/**

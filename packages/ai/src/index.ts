@@ -30,6 +30,7 @@ export * from "./utils/json-parse.js";
 export type {
 	OAuthAuthInfo,
 	OAuthCredentials,
+	OAuthDeviceCodeInfo,
 	OAuthLoginCallbacks,
 	OAuthPrompt,
 	OAuthProvider,

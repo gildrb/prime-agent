@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -205,6 +206,52 @@ describe("ProviderAuthFlows", () => {
 		expect(stripAnsi(overlays[0]?.render(80).join("\n") ?? "")).toContain("Prime Inference");
 		overlays[0]?.handleInput?.("\x1b");
 		await expect(logoutResult).resolves.toBeNull();
+	});
+
+	it("renders device-code login without arming browser callback input", async () => {
+		const providerId = `test-device-code-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		registerOAuthProvider({
+			id: providerId,
+			name: "Test Device Provider",
+			usesCallbackServer: true,
+			async login(callbacks) {
+				callbacks.onDeviceCode?.({
+					userCode: "ABCD-1234",
+					verificationUri: "https://example.com/device",
+					expiresInSeconds: 900,
+				});
+				return new Promise((_, reject) => {
+					callbacks.signal?.addEventListener("abort", () => reject(new Error("Login cancelled")), { once: true });
+				});
+			},
+			async refreshToken(credentials) {
+				return credentials;
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		try {
+			const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+			const { host, overlays } = createHost(authStorage);
+			const loginResult = new ProviderAuthFlows(host).loginProvider({
+				id: providerId,
+				name: "Test Device Provider",
+				authType: "oauth",
+			});
+
+			expect(overlays).toHaveLength(1);
+			const output = stripAnsi(overlays[0]?.render(88).join("\n") ?? "");
+			expect(output).toContain("Device sign-in");
+			expect(output).toContain("ABCD-1234");
+			expect(output).toContain("Waiting for device authentication...");
+			expect(output).not.toContain("Manual fallback");
+			overlays[0]?.handleInput?.("\x1b");
+			await expect(loginResult).resolves.toEqual({ status: "cancelled" });
+		} finally {
+			unregisterOAuthProvider(providerId);
+		}
 	});
 
 	it("opens login on the requested MCP Connections category", async () => {

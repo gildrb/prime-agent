@@ -65,6 +65,31 @@ describe("LoginDialogComponent", () => {
 		expect(output).not.toContain("> ");
 	});
 
+	it("renders and copies device login without a manual callback field", async () => {
+		const dialog = new LoginDialogComponent(createFakeTui(), "openai-codex", () => {}, "ChatGPT Plus/Pro");
+		const verificationUri = "https://auth.openai.com/codex/device";
+
+		dialog.showDeviceCode({
+			userCode: "ABCD-1234",
+			verificationUri,
+			intervalSeconds: 5,
+			expiresInSeconds: 900,
+		});
+		const output = stripAnsi(dialog.render(88).join("\n"));
+
+		expect(output).toContain("Device sign-in");
+		expect(output).toContain("Verification link");
+		expect(output).toContain(verificationUri);
+		expect(output).toContain("Verification code");
+		expect(output).toContain("ABCD-1234");
+		expect(output).toContain("Code expires in 15 minutes.");
+		expect(output).not.toContain("Manual fallback");
+		expect(output).not.toContain("Paste value");
+
+		dialog.handleInput("c");
+		await vi.waitFor(() => expect(mocks.copyToClipboard).toHaveBeenCalledWith(verificationUri));
+	});
+
 	it("copies the raw sign-in URL with the configured shortcut", async () => {
 		const dialog = new LoginDialogComponent(createFakeTui(), "anthropic", () => {}, "Anthropic");
 		const url = "https://example.com/oauth?client_id=test&redirect_uri=https%3A%2F%2Flocalhost%2Fcallback";

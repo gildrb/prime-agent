@@ -25,6 +25,7 @@ Use `/logout` to clear credentials. Tokens are stored in `~/.prime/agent/auth.js
 
 - Requires ChatGPT Plus or Pro subscription
 - Officially endorsed by OpenAI: [Codex for OSS](https://developers.openai.com/community/codex-for-oss)
+- On a headless or SSH host, select **Device code login (headless)**, open the displayed verification URL on any browser, and enter the one-time code. No localhost callback or SSH port forwarding is required.
 
 ### Claude Pro/Max
 
