@@ -18,6 +18,7 @@ import {
 	shouldOpenAgentsViewForDaemonInteractive,
 	shouldRejectNonInteractiveAttach,
 	shouldRejectNonInteractiveBareResume,
+	shouldSkipBuiltinHerdrReporter,
 	shouldUseDaemonClient,
 	shouldUseDaemonClientRuntime,
 	shouldUseDaemonInteractive,
@@ -26,6 +27,15 @@ import {
 import type { SessionSummary } from "../src/modes/index.js";
 
 describe("interactive startup routing", () => {
+	test("loads the Herdr reporter only for root interactive sessions", () => {
+		expect(shouldSkipBuiltinHerdrReporter("interactive")).toBe(false);
+		expect(shouldSkipBuiltinHerdrReporter(undefined)).toBe(false);
+		expect(shouldSkipBuiltinHerdrReporter("interactive", 1)).toBe(true);
+		for (const mode of ["print", "json", "rpc", "acp"] as const) {
+			expect(shouldSkipBuiltinHerdrReporter(mode)).toBe(true);
+		}
+	});
+
 	test.each([
 		["acp", false, false],
 		["acp", true, true],

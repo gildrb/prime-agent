@@ -164,6 +164,10 @@ export type ClientMode = AgentExecutionMode;
 /** Compatibility view of the CLI's internal daemon process entrypoint. */
 export type AppMode = ClientMode | "daemon";
 
+export function shouldSkipBuiltinHerdrReporter(executionMode: AgentExecutionMode | undefined, rlmDepth = 0): boolean {
+	return rlmDepth > 0 || (executionMode !== undefined && executionMode !== "interactive");
+}
+
 export function shouldRejectNonInteractiveAttach(attachAgent: string | undefined, appMode: AppMode): boolean {
 	return attachAgent !== undefined && appMode !== "interactive";
 }
@@ -741,9 +745,12 @@ async function prepareRuntimeServices(options: {
 		agentDir: effectiveAgentDir,
 		authStorage,
 		extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
-		// Subagents share the parent's Herdr pane; their own reporter would race
-		// the parent's and a subagent quit would release the still-active pane.
-		noBuiltinHerdrReporter: (options.sessionOptionsOverride?.rlmDepth ?? 0) > 0,
+		// Only the root interactive TUI owns the Herdr pane. Headless clients and
+		// subagents may inherit its environment but must not report or release it.
+		noBuiltinHerdrReporter: shouldSkipBuiltinHerdrReporter(
+			config.executionMode,
+			options.sessionOptionsOverride?.rlmDepth,
+		),
 		telemetryDisabled: config.telemetryDisabled,
 		resourceLoaderOptions: {
 			additionalExtensionPaths: config.extensions,

@@ -12,7 +12,8 @@ export default defineConfig({
 		globals: true,
 		environment: "node",
 		testTimeout: 30000,
-		env: { DO_NOT_TRACK: "1" },
+		// Test workers and their child CLIs must not claim the invoking Herdr pane.
+		env: { DO_NOT_TRACK: "1", HERDR_ENV: "0" },
 		tags: [
 			{
 				name: "process-stress",

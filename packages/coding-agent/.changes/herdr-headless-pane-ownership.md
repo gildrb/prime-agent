@@ -1,0 +1,1 @@
+- Fixed headless sessions and test subprocesses inheriting a Herdr pane and overwriting its interactive agent state.
