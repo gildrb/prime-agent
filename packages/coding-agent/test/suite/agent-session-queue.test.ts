@@ -57,6 +57,15 @@ type SteeringStopInternals = {
 	_clearQueuedGoalContexts(): void;
 };
 
+type LowerBoundaryHandoffInternals = {
+	_actionStore: {
+		activeActions(): ReadonlyArray<{
+			lifecycle: { state: string };
+			payload: { kind: string; text: string; lowerBoundaryDispatched?: boolean };
+		}>;
+	};
+};
+
 function emptyRefinementResult(): RefinementResult {
 	return {
 		id: "refine_test",
@@ -3069,6 +3078,160 @@ describe("AgentSession scheduler scenarios", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it("delivers the first mid-run steer inside the active lower-agent run", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			(context) => {
+				const sawSteer = context.messages.some(
+					(message) => message.role === "user" && getMessageText(message) === "first steer",
+				);
+				return fauxAssistantMessage(sawSteer ? "handled first steer" : "missing first steer");
+			},
+		]);
+
+		await waitForToolStart;
+		await harness.session.promptUntilAccepted("first steer", {
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			resumeIfIdle: true,
+		});
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["start", "first steer"]);
+		expect(getAssistantTexts(harness)).toEqual(["", "handled first steer"]);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
+	});
+
+	it("keeps promptAndWait pending through the full steered tool chain", async () => {
+		const toolStarted = createDeferred();
+		const toolRelease = createDeferred();
+		const providerStarted = createDeferred();
+		const providerRelease = createDeferred();
+		const steeredTool: AgentTool = {
+			name: "steered-wait",
+			label: "Steered wait",
+			description: "Wait inside the steered response",
+			parameters: Type.Object({}),
+			execute: async () => {
+				toolStarted.resolve();
+				await toolRelease.promise;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const waiting = await createWaitingHarness({ tools: [steeredTool] });
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("steered-wait", {}), { stopReason: "toolUse" }),
+			async () => {
+				providerStarted.resolve();
+				await providerRelease.promise;
+				return fauxAssistantMessage("steered chain complete");
+			},
+		]);
+
+		await waitForToolStart;
+		let completionSettled = false;
+		const completion = harness.session
+			.promptAndWait("steer through tool", {
+				streamingBehavior: "steer",
+				queueIfBusy: true,
+				resumeIfIdle: true,
+			})
+			.finally(() => {
+				completionSettled = true;
+			});
+		await vi.waitFor(() => expect(harness.session.getSteeringMessages()).toEqual(["steer through tool"]));
+		releaseToolExecution();
+		await toolStarted.promise;
+		expect(completionSettled).toBe(false);
+		expect(harness.session.isStreaming).toBe(true);
+		toolRelease.resolve();
+		await providerStarted.promise;
+		expect(completionSettled).toBe(false);
+		expect(harness.session.isStreaming).toBe(true);
+		providerRelease.resolve();
+
+		await Promise.all([completion, promptPromise]);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
+	});
+
+	it("does not clear a lower-boundary message after its handoff is committed", async () => {
+		const boundaryReturned = createDeferred();
+		const boundaryRelease = createDeferred();
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("agent message delivered"),
+		]);
+
+		await waitForToolStart;
+		const getSteeringMessages = harness.session.agent.getSteeringMessages;
+		harness.session.agent.getSteeringMessages = async () => {
+			const messages = (await getSteeringMessages?.()) ?? [];
+			if (messages.length > 0) {
+				boundaryReturned.resolve();
+				await boundaryRelease.promise;
+			}
+			return messages;
+		};
+		const id = "agentmsg_committed_boundary";
+		const message = agentPromptText(id, "committed handoff");
+		const delivery = harness.session.waitForAgentMessagePromptDelivery(id);
+		await harness.session.queueAgentMessagePrompt(message, "steer");
+		releaseToolExecution();
+		await boundaryReturned.promise;
+		const active = (harness.session as unknown as LowerBoundaryHandoffInternals)._actionStore
+			.activeActions()
+			.find((action) => action.payload.text === message);
+		expect(active).toMatchObject({
+			lifecycle: { state: "committing" },
+			payload: { lowerBoundaryDispatched: true },
+		});
+
+		const cleared = harness.session.clearQueuedAgentMessages();
+		boundaryRelease.resolve();
+		await expect(delivery).resolves.toBeUndefined();
+		await promptPromise;
+
+		expect(cleared).toEqual({ steering: [], followUp: [] });
+		expect(getUserTexts(harness)).toEqual(["start", message]);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
+	});
+
+	it("stops for a requested compaction before handing steering to a new run", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("handled after compaction boundary"),
+		]);
+
+		await waitForToolStart;
+		await harness.session.steer("after requested compaction");
+		(
+			harness.session as unknown as {
+				_pendingRequestedCompaction?: { customInstructions?: string };
+			}
+		)._pendingRequestedCompaction = {};
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.waitForIdle();
+
+		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toContain("requested");
+		expect(getUserTexts(harness)).toEqual(["start", "after requested compaction"]);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(2);
 	});
 
 	it("S1: delivers mid-run steering, follow-up, command, and custom inputs in order", async () => {

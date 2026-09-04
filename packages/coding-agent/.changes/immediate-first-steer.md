@@ -1,0 +1,1 @@
+- Fixed the first mid-run steering message to run in the active agent loop unless mandatory compaction must run first.

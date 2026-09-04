@@ -600,6 +600,7 @@ interface PreparedTurnPayload extends SessionTurnPayload {
 	queueVisible: boolean;
 	acceptedAgentMessage: boolean;
 	acceptedBeforeCompletion: boolean;
+	lowerBoundaryDispatched?: boolean;
 	captureRunMessages?: Set<AgentMessage>;
 	cancelledDispatchEnded?: boolean;
 }
@@ -1062,6 +1063,8 @@ export class AgentSession {
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
+	private readonly _lowerBoundarySteeringActions = new Set<QueuedSessionAction>();
+	private _lowerBoundarySteeringHandoffBlocked = false;
 	private _sessionInputPump: Promise<void> = Promise.resolve();
 	private _sessionInputPumpRequested = false;
 	// Invalidates preparation when a branch pause starts and finishes before its next await resumes.
@@ -1304,6 +1307,7 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 		this._installAgentTurnHook();
+		this._installAgentSteeringHook();
 		this._installAgentContinuationHook();
 
 		this._buildRuntime({
@@ -1484,6 +1488,10 @@ export class AgentSession {
 				isError: hookResult.isError ?? isError,
 			};
 		};
+	}
+
+	private _installAgentSteeringHook(): void {
+		this.agent.getSteeringMessages = () => this._getSteeringMessagesAtLowerBoundary();
 	}
 
 	private _installAgentContinuationHook(): void {
@@ -2205,8 +2213,50 @@ export class AgentSession {
 		);
 	}
 
+	private _canHandoffSteeringAtLowerBoundary(): boolean {
+		const first = this._actionStore.queuedActions("next_turn_boundary")[0];
+		return (
+			first?.payload.kind === "turn" &&
+			!this._lowerBoundarySteeringHandoffBlocked &&
+			this.isStreaming &&
+			!this.isCompacting &&
+			!this.isRetrying &&
+			!this.isBashRunning &&
+			this._branchSummaryOperation === undefined &&
+			!this._sessionInputPumpSuspended &&
+			this._queuedWorkPauses.size === 0 &&
+			!this._disposed &&
+			!this._disposing
+		);
+	}
+
 	private _shouldStopBeforeTurn(): boolean {
-		return this._steeringStopPending;
+		return this._steeringStopPending && !this._canHandoffSteeringAtLowerBoundary();
+	}
+
+	private _settleLowerBoundarySteeringActionsAtAgentEnd(): void {
+		let changed = false;
+		for (const action of this._lowerBoundarySteeringActions) {
+			if (action.payload.kind !== "turn") continue;
+			if (action.lifecycle.state === "committing") {
+				action.payload.lowerBoundaryDispatched = false;
+				this._actionStore.rollback(action, { dispatchSettled: true, transcript: this.agent.state.messages });
+				this._lowerBoundarySteeringActions.delete(action);
+				changed = true;
+				continue;
+			}
+			if (action.lifecycle.state !== "running" || !primaryDeliveryRecord(action).durable) continue;
+			transitionSessionAction(action, { state: "completed" });
+			this._actionStore.ticketFor(action).settleCompleted();
+			this._settleAgentMessage(action.agentMessageId, "completion");
+			this._actionStore.releaseTerminal(action);
+			this._lowerBoundarySteeringActions.delete(action);
+			changed = true;
+		}
+		if (changed) {
+			this._notifySessionInputCheckpointChange();
+			this._emitQueueUpdate();
+		}
 	}
 
 	private async _shouldStopAfterTurn(context: ShouldStopAfterTurnContext): Promise<boolean> {
@@ -2237,12 +2287,14 @@ export class AgentSession {
 			await this._agentEventQueue;
 			await this._runSerializedRefineCheckpoint();
 		}
+		// Mandatory threshold or requested compaction owns this boundary. The
+		// queued steer remains session-owned and the pump starts it after compaction.
 		if (await this._shouldStopForThresholdCompaction(context)) {
 			return true;
 		}
-		// Steering stops continuation only after mandatory serialized checkpoints.
-		// Returning true here still prevents the agent loop from starting another turn.
-		return this._steeringStopPending;
+		// Steering that cannot hand off inside the active lower-agent run stops it only
+		// after mandatory serialized checkpoints.
+		return this._shouldStopBeforeTurn();
 	}
 
 	private async _shouldStopForThresholdCompaction(context: ShouldStopAfterTurnContext): Promise<boolean> {
@@ -3676,6 +3728,7 @@ export class AgentSession {
 				(this._retryPromise ? this._findLastAssistantInMessages(event.messages) : undefined);
 			this._lastAssistantMessage = undefined;
 			if (!msg) {
+				this._settleLowerBoundarySteeringActionsAtAgentEnd();
 				this._resolveRetry();
 				return;
 			}
@@ -3711,6 +3764,7 @@ export class AgentSession {
 					}
 				}
 			}
+			this._settleLowerBoundarySteeringActionsAtAgentEnd();
 		}
 	}
 
@@ -5762,6 +5816,7 @@ export class AgentSession {
 					for (const action of actions) this._actionStore.rollback(action);
 					return;
 				}
+				this._lowerBoundarySteeringHandoffBlocked = false;
 				for (const action of actions) transitionSessionAction(action, { state: "preparing" });
 				this._notifySessionInputCheckpointChange();
 				this._emitQueueUpdate();
@@ -5946,6 +6001,45 @@ export class AgentSession {
 		return false;
 	}
 
+	private async _getSteeringMessagesAtLowerBoundary(): Promise<AgentMessage[]> {
+		if (!this._canHandoffSteeringAtLowerBoundary()) return [];
+		const firstQueued = this._actionStore.queuedActions("next_turn_boundary")[0];
+		const first = this._actionStore.selectFirst();
+		if (!first || first !== firstQueued || first.payload.kind !== "turn") {
+			if (first) this._actionStore.rollback(first);
+			return [];
+		}
+		const actions: QueuedSessionAction[] = [first];
+		while (this.steeringMode === "all") {
+			const next = this._actionStore.queuedActions("next_turn_boundary")[0];
+			if (
+				!next ||
+				next.payload.kind !== "turn" ||
+				!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
+			) {
+				break;
+			}
+			this._actionStore.selectFirst();
+			actions.push(next);
+		}
+		for (const action of actions) transitionSessionAction(action, { state: "preparing" });
+		this._notifySessionInputCheckpointChange();
+		this._emitQueueUpdate();
+		try {
+			return await this._startPreparedTurnActions(actions, this._sessionInputPumpEpoch, "active_run");
+		} catch {
+			this._lowerBoundarySteeringHandoffBlocked = true;
+			for (const action of actions) {
+				if (action.lifecycle.state === "preparing" || action.lifecycle.state === "selected") {
+					this._actionStore.rollback(action);
+				}
+			}
+			this._notifySessionInputCheckpointChange();
+			this._emitQueueUpdate();
+			return [];
+		}
+	}
+
 	private _surfaceSessionInputError(error: unknown): void {
 		const normalized = this._asError(error);
 		try {
@@ -5960,7 +6054,11 @@ export class AgentSession {
 		}
 	}
 
-	private async _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
+	private async _startPreparedTurnActions(
+		actions: QueuedSessionAction[],
+		epoch: number,
+		delivery: "new_run" | "active_run" = "new_run",
+	): Promise<AgentMessage[]> {
 		let nextTurnMessages: CustomMessage[] = [];
 		const activeTurns = () =>
 			actions.filter(
@@ -5968,7 +6066,7 @@ export class AgentSession {
 					action.payload.kind === "turn" && action.lifecycle.state === "preparing",
 			);
 		const firstTurn = activeTurns()[0];
-		if (!firstTurn) return;
+		if (!firstTurn) return [];
 		const executionPolicy = firstTurn.payload.executionPolicy;
 		const restoreNextTurnContext = () => {
 			this._pendingNextTurnMessages.unshift(...nextTurnMessages);
@@ -6020,19 +6118,20 @@ export class AgentSession {
 			});
 			if (!preparedTurn) {
 				restoreNextTurnContext();
-				return;
+				return [];
 			}
 			const { prepared, turns } = preparedTurn;
 			const commitFence = await this._acquireSessionActionCommitFence();
-			let promptPromise: Promise<void>;
+			let promptPromise: Promise<void> | undefined;
+			let boundaryMessages: AgentMessage[] = [];
 			try {
-				promptPromise = this._sessionActionCommitContext.run(commitFence.owner, () => {
+				this._sessionActionCommitContext.run(commitFence.owner, () => {
 					if (
 						this._isSessionInputHandoffDeferred(epoch) ||
-						this.isStreaming ||
+						(delivery === "new_run" ? this.isStreaming : !this.isStreaming) ||
 						turns.some((action) => action.lifecycle.state !== "preparing")
 					) {
-						throw new DeferredSessionInputError("Agent became active before session input handoff");
+						throw new DeferredSessionInputError("Agent activity changed before session input handoff");
 					}
 					if (executionPolicy.nextTurnContextTiming === "commit") {
 						nextTurnMessages = this._takePendingNextTurnMessages();
@@ -6059,13 +6158,28 @@ export class AgentSession {
 					for (const action of turns) transitionSessionAction(action, { state: "committing" });
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
-					return turns.some((action) => action.suppressAutonomousContinuation)
+					if (delivery === "active_run") {
+						boundaryMessages = preparedMessages;
+						for (const action of turns) {
+							action.payload.lowerBoundaryDispatched = true;
+							this._lowerBoundarySteeringActions.add(action);
+						}
+						return;
+					}
+					promptPromise = turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
 						: this.agent.prompt(preparedMessages);
 				});
 			} finally {
 				commitFence.release();
 			}
+			if (delivery === "active_run") {
+				this._forgetConsumedPostCompactionContinuations(
+					turns.map((action) => primaryDeliveryRecord(action).message),
+				);
+				return boundaryMessages;
+			}
+			if (!promptPromise) throw new Error("Session input handoff did not start an agent run");
 			await promptPromise;
 			if (executionPolicy.completionIncludesRetryChain) await this.waitForRetry();
 			if (!this._hasCancelledDispatchCapture()) await this._agentEventQueue;
@@ -6080,6 +6194,7 @@ export class AgentSession {
 				throw new Error("Session input dispatch settled without durable delivery");
 			}
 			this._forgetConsumedPostCompactionContinuations(turns.map((action) => primaryDeliveryRecord(action).message));
+			return [];
 		} catch (error) {
 			const delivered = new Set(this.agent.state.messages);
 			this._pendingNextTurnMessages.unshift(...nextTurnMessages.filter((message) => !delivered.has(message)));
@@ -6370,6 +6485,7 @@ export class AgentSession {
 					action.lifecycle.state === "preparing" ||
 					(action.lifecycle.state === "committing" &&
 						dispatchedTurnCount === 1 &&
+						!action.payload.lowerBoundaryDispatched &&
 						!primaryDeliveryRecord(action).started)),
 		);
 		if (matching.length === 0) return { steering: [], followUp: [] };
