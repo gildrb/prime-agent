@@ -378,8 +378,9 @@ function readOpenAICodexAccountId(token: string): string | undefined {
  * and keeps offering it.
  *
  * Catalog behaviour measured 2026-08-13; see #702.
+ * gpt-6-astra requires >= 0.153.0 (measured 2026-09-05).
  */
-const OPENAI_CODEX_CLIENT_VERSION = "0.147.0";
+const OPENAI_CODEX_CLIENT_VERSION = "0.153.2";
 
 function openAICodexModelsUrl(baseUrl: string): string {
 	const normalized = baseUrl.replace(/\/+$/, "");
